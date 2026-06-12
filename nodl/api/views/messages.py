@@ -7,6 +7,7 @@ Bearer token (JWT) authentication, not browser session cookies.
 
 import json
 import logging
+import re
 from collections import defaultdict
 from collections.abc import Callable
 from contextlib import suppress
@@ -625,6 +626,179 @@ def list_messages(request: HttpRequest) -> HttpResponse:
             "found_oldest": found_oldest,
             "found_newest": found_newest,
             "history_limited": False,
+        }
+    )
+
+
+# Search query tokenizer: `-op:"quoted value"`, `-op:value`, `"quoted words"`, `word`
+_SEARCH_TOKEN_RE = re.compile(r'-?[A-Za-z_]+:"[^"]*"|-?[A-Za-z_]+:[^\s"]+|"[^"]*"|\S+')
+
+# Operators understood by search; anything else is treated as plain text
+_SEARCH_OPERATORS = {"stream", "channel", "topic", "sender", "is"}
+
+
+def _parse_search_query(query: str) -> tuple[list[tuple[bool, str, str]], list[str]]:
+    """Split a search query into (negated, operator, value) filters and plain words.
+
+    Unknown operators are kept as plain words so a query like `re:something`
+    still searches for that text instead of erroring.
+    """
+    filters: list[tuple[bool, str, str]] = []
+    words: list[str] = []
+
+    for token in _SEARCH_TOKEN_RE.findall(query):
+        negated = token.startswith("-")
+        body = token[1:] if negated else token
+
+        if not body.startswith('"') and ":" in body:
+            operator, _, value = body.partition(":")
+            value = value.strip('"')
+            if operator.lower() in _SEARCH_OPERATORS and value:
+                filters.append((negated, operator.lower(), value))
+                continue
+
+        word = body.strip('"')
+        if word:
+            words.append(word)
+
+    return filters, words
+
+
+@require_jwt_auth
+@rate_limit(key_prefix="messages_read", limit=MESSAGES_READ_LIMIT)
+def search_messages(request: HttpRequest) -> HttpResponse:
+    """Search messages the user has received.
+
+    GET /api/v1/messages/search?query=...&page=1&limit=20
+
+    The query string supports operators (negatable with a leading `-`):
+    - stream:<name> / channel:<name>
+    - topic:<topic>
+    - sender:<email or name>
+    - is:dm
+    Remaining words are AND-ed substring matches on message content.
+
+    Scoping note: results are filtered through UserMessage (messages actually
+    delivered to the user — subscribed streams and own DMs). This gives access
+    control for free, at the cost of excluding public-stream history from
+    before the user subscribed. Plain ILIKE matching is used instead of
+    Zulip's tsvector full-text search because the latter depends on the
+    process_fts_updates daemon; revisit if message volume makes ILIKE slow.
+
+    Response:
+    {
+        "result": "success",
+        "messages": [...],   // newest first, Zulip message dicts
+        "total": 42,
+        "highlights": {}      // reserved; highlighting is client-side
+    }
+    """
+    if request.method != "GET":
+        return JsonResponse(
+            {"result": "error", "code": "METHOD_NOT_ALLOWED", "msg": "GET required"},
+            status=405,
+        )
+
+    user: UserProfile = request.user_profile  # type: ignore[attr-defined]
+
+    query = (request.GET.get("query") or "").strip()
+    if not query:
+        return JsonResponse(
+            {"result": "error", "code": "INVALID_PARAMS", "msg": "query is required"},
+            status=400,
+        )
+
+    try:
+        page = int(request.GET.get("page", 1))
+        limit = int(request.GET.get("limit", 20))
+    except ValueError:
+        return JsonResponse(
+            {"result": "error", "code": "INVALID_PARAMS", "msg": "Invalid pagination parameters"},
+            status=400,
+        )
+
+    page = max(1, page)
+    limit = min(max(1, limit), 50)
+
+    filters, words = _parse_search_query(query)
+    if not filters and not words:
+        return JsonResponse(
+            {"result": "error", "code": "INVALID_PARAMS", "msg": "query is required"},
+            status=400,
+        )
+
+    from django.db.models import Q
+
+    from zerver.models import Recipient, Stream
+
+    # Messages delivered to this user (subscribed streams + own DMs)
+    qs = UserMessage.objects.filter(
+        user_profile=user,
+        message__realm_id=user.realm_id,
+    )
+
+    for negated, operator, value in filters:
+        condition: Q | None = None
+
+        if operator in ("stream", "channel"):
+            stream = Stream.objects.filter(realm=user.realm, name__iexact=value).first()
+            if stream is None:
+                if negated:
+                    continue  # excluding a non-existent stream excludes nothing
+                qs = qs.none()
+                break
+            condition = Q(message__recipient_id=stream.recipient_id)
+        elif operator == "topic":
+            condition = Q(message__subject__iexact=value)
+        elif operator == "sender":
+            if "@" in value:
+                condition = Q(message__sender__delivery_email__iexact=value)
+            else:
+                condition = Q(message__sender__full_name__icontains=value)
+        elif operator == "is" and value.lower() in ("dm", "direct", "private"):
+            condition = Q(
+                message__recipient__type__in=[
+                    Recipient.PERSONAL,
+                    Recipient.DIRECT_MESSAGE_GROUP,
+                ]
+            )
+
+        if condition is None:
+            continue
+        qs = qs.exclude(condition) if negated else qs.filter(condition)
+
+    for word in words:
+        qs = qs.filter(message__content__icontains=word)
+
+    total = qs.count()
+    message_ids = list(
+        qs.order_by("-message_id").values_list("message_id", flat=True)[
+            (page - 1) * limit : page * limit
+        ]
+    )
+
+    if message_ids:
+        message_data = messages_for_ids(
+            message_ids=message_ids,
+            user_message_flags={mid: [] for mid in message_ids},
+            search_fields={},
+            apply_markdown=True,
+            client_gravatar=False,
+            allow_empty_topic_name=False,
+            message_edit_history_visibility_policy=1,  # UserProfile.POLICY_ALLOW_ANYONE
+            user_profile=user,
+            realm=user.realm,
+        )
+    else:
+        message_data = []
+
+    return JsonResponse(
+        {
+            "result": "success",
+            "msg": "",
+            "messages": message_data,
+            "total": total,
+            "highlights": {},
         }
     )
 
