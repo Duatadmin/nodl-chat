@@ -46,6 +46,10 @@ class CheckinCard(BaseModel):
     question: str
     due_date: str | None = None
     options: list[str] = Field(default_factory=lambda: ["on_track", "blocked", "needs_extension"])
+    # Story 7.33: numeric one-tap remaining-duration chips (working days) on
+    # statusing cards, and the recorded answer on the responded re-encode.
+    remaining_options: list[int] = Field(default_factory=list)
+    remaining_days: int | None = None
     status: Literal["pending", "responded"] = "pending"
     response: str | None = None
 
