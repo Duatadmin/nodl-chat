@@ -32,10 +32,14 @@ class TestWorkspaceSyncService(TestCase):
             members=[],
         )
 
+    @patch("nodl.sync.workspace_sync.do_add_default_stream")
     @patch("nodl.sync.workspace_sync.do_create_realm")
     @patch("nodl.sync.workspace_sync.ensure_stream")
     def test_sync_creates_realm_with_default_stream(
-        self, mock_ensure_stream: MagicMock, mock_create_realm: MagicMock
+        self,
+        mock_ensure_stream: MagicMock,
+        mock_create_realm: MagicMock,
+        mock_add_default: MagicMock,
     ) -> None:
         """Test sync creates realm with default #general stream (IV1)."""
         mock_realm = MagicMock()
@@ -54,16 +58,21 @@ class TestWorkspaceSyncService(TestCase):
         self.assertEqual(call_kwargs["description"], "A test workspace")
         self.assertFalse(call_kwargs["create_zulip_discussion_channel"])
 
-        # Verify default stream created
+        # Verify default stream created and registered as a DefaultStream
         mock_ensure_stream.assert_called_once()
         stream_kwargs = mock_ensure_stream.call_args.kwargs
         self.assertEqual(stream_kwargs["stream_name"], "general")
         self.assertFalse(stream_kwargs["invite_only"])
+        mock_add_default.assert_called_once_with(mock_ensure_stream.return_value)
 
+    @patch("nodl.sync.workspace_sync.do_add_default_stream")
     @patch("nodl.sync.workspace_sync.do_create_realm")
     @patch("nodl.sync.workspace_sync.ensure_stream")
     def test_sync_creates_extension_record(
-        self, mock_ensure_stream: MagicMock, mock_create_realm: MagicMock
+        self,
+        mock_ensure_stream: MagicMock,
+        mock_create_realm: MagicMock,
+        mock_add_default: MagicMock,
     ) -> None:
         """Test sync creates NodlRealmExtension record."""
         mock_realm = MagicMock()
@@ -139,8 +148,11 @@ class TestMemberSync(TestCase):
         """Set up test fixtures."""
         self.service = WorkspaceSyncService()
 
+    @patch.object(WorkspaceSyncService, "_ensure_general_subscriptions")
     @patch("nodl.sync.workspace_sync.UserSyncService")
-    def test_sync_workspace_members(self, mock_user_sync_service: MagicMock) -> None:
+    def test_sync_workspace_members(
+        self, mock_user_sync_service: MagicMock, mock_ensure_general: MagicMock
+    ) -> None:
         """Test member sync calls UserSyncService for each member."""
         mock_instance = MagicMock()
         mock_instance.sync_user.return_value = MagicMock(success=True, zulip_user_id=1)
@@ -167,11 +179,16 @@ class TestMemberSync(TestCase):
 
         self.service.sync_workspace_members(mock_realm, members)
 
-        # Verify UserSyncService called for each member
+        # Verify UserSyncService called for each member, and the synced ids
+        # were handed to the #general subscription pass
         self.assertEqual(mock_instance.sync_user.call_count, 2)
+        mock_ensure_general.assert_called_once_with(mock_realm, [1, 1])
 
+    @patch.object(WorkspaceSyncService, "_ensure_general_subscriptions")
     @patch("nodl.sync.workspace_sync.UserSyncService")
-    def test_member_sync_continues_on_failure(self, mock_user_sync_service: MagicMock) -> None:
+    def test_member_sync_continues_on_failure(
+        self, mock_user_sync_service: MagicMock, mock_ensure_general: MagicMock
+    ) -> None:
         """Test member sync continues even if one member fails."""
         mock_instance = MagicMock()
         # First member fails, second succeeds
@@ -197,8 +214,9 @@ class TestMemberSync(TestCase):
         # Should not raise exception
         self.service.sync_workspace_members(mock_realm, members)
 
-        # Both members were attempted
+        # Both members were attempted; only the successful one is subscribed
         self.assertEqual(mock_instance.sync_user.call_count, 2)
+        mock_ensure_general.assert_called_once_with(mock_realm, [2])
 
 
 class TestRealmDeactivation(TestCase):
@@ -325,3 +343,83 @@ class TestWorkspaceSyncResult(TestCase):
         self.assertFalse(result.success)
         self.assertIsNone(result.zulip_realm_id)
         self.assertEqual(result.error, "Test error message")
+
+
+class TestEnsureGeneralSubscriptions(TestCase):
+    """Real-DB tests for the #general DefaultStream + subscription pass."""
+
+    def _make_realm_and_users(self) -> tuple:
+        from zerver.actions.create_realm import do_create_realm
+        from zerver.actions.create_user import do_create_user
+
+        realm = do_create_realm(
+            string_id="gensubtest",
+            name="General Sub Test",
+            create_zulip_discussion_channel=False,
+        )
+        users = [
+            do_create_user(
+                email=f"gensub{i}@nodl.local",
+                password=None,
+                realm=realm,
+                full_name=f"Gen Sub {i}",
+                acting_user=None,
+            )
+            for i in range(2)
+        ]
+        return realm, users
+
+    def test_subscribes_members_and_registers_default_stream(self) -> None:
+        from zerver.models import DefaultStream, Stream, Subscription
+
+        realm, users = self._make_realm_and_users()
+        service = WorkspaceSyncService()
+
+        service._ensure_general_subscriptions(realm, [u.id for u in users])
+
+        stream = Stream.objects.get(realm=realm, name="general")
+        self.assertTrue(DefaultStream.objects.filter(realm=realm, stream=stream).exists())
+        for user in users:
+            self.assertTrue(
+                Subscription.objects.filter(
+                    user_profile=user, recipient=stream.recipient, active=True
+                ).exists()
+            )
+
+    def test_idempotent_on_second_run(self) -> None:
+        from zerver.models import Stream, Subscription
+
+        realm, users = self._make_realm_and_users()
+        service = WorkspaceSyncService()
+        user_ids = [u.id for u in users]
+
+        service._ensure_general_subscriptions(realm, user_ids)
+        service._ensure_general_subscriptions(realm, user_ids)
+
+        stream = Stream.objects.get(realm=realm, name="general")
+        self.assertEqual(
+            Subscription.objects.filter(
+                recipient=stream.recipient,
+                active=True,
+                user_profile_id__in=user_ids,
+            ).count(),
+            len(users),
+        )
+
+    def test_never_raises(self) -> None:
+        realm, _users = self._make_realm_and_users()
+        service = WorkspaceSyncService()
+        with patch(
+            "nodl.sync.workspace_sync.ensure_stream",
+            side_effect=Exception("boom"),
+        ):
+            # Must swallow — a subscription failure never fails the sync.
+            service._ensure_general_subscriptions(realm, [1])
+
+    def test_empty_user_list_is_noop(self) -> None:
+        from zerver.models import Stream
+
+        realm, _users = self._make_realm_and_users()
+        service = WorkspaceSyncService()
+        service._ensure_general_subscriptions(realm, [])
+        self.assertFalse(Stream.objects.filter(realm=realm, name="general").exists())

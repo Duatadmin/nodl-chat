@@ -9,6 +9,7 @@ import logging
 import jwt
 from django.conf import settings
 from django.core.cache import cache
+from django.core.exceptions import ValidationError
 from django.http import HttpRequest, JsonResponse
 from django.http.response import HttpResponseBase
 from django.utils.crypto import constant_time_compare
@@ -294,15 +295,22 @@ class SupabaseJWTMiddleware:
         # Cache miss - query database
         try:
             queryset = UserProfile.objects.filter(
-                delivery_email=email,
+                delivery_email__iexact=email,
                 is_active=True,
             )
 
-            # If workspace_id provided, filter by realm string_id
+            # If workspace_id provided, filter by realm.  NodlRealmExtension is
+            # the authoritative workspace↔realm map; the truncated string_id is
+            # only a legacy fallback for realms that predate the extension.
             if workspace_id:
-                # Realm string_id is first 20 chars of workspace_id
-                realm_string_id = workspace_id[:20].lower()
-                queryset = queryset.filter(realm__string_id=realm_string_id)
+                from nodl.extensions.models import NodlRealmExtension
+
+                try:
+                    extension = NodlRealmExtension.objects.get(nodl_workspace_id=workspace_id)
+                    queryset = queryset.filter(realm_id=extension.zulip_realm_id)
+                except (NodlRealmExtension.DoesNotExist, ValidationError, ValueError):
+                    realm_string_id = workspace_id[:20].lower()
+                    queryset = queryset.filter(realm__string_id=realm_string_id)
 
             user_profile = queryset.get()
             cache.set(cache_key, user_profile, USER_PROFILE_CACHE_TIMEOUT)
@@ -314,16 +322,18 @@ class SupabaseJWTMiddleware:
             return None
 
         except UserProfile.MultipleObjectsReturned:
-            # User exists in multiple realms - return most recently created
-            # This can happen when same email is used across workspaces
-            logger.warning(
-                f"[nodl-auth] Multiple UserProfiles found for {email}, "
-                "using most recently created. Consider passing X-Workspace-Id header."
+            # User exists in multiple realms and no (usable) X-Workspace-Id
+            # was sent.  Return the most recently created profile but do NOT
+            # cache the guess: caching would pin an ambiguous request's realm
+            # for a minute, making the wrong choice sticky.
+            logger.error(
+                "[nodl-auth] Multiple UserProfiles found for %s and no "
+                "X-Workspace-Id header; using most recently created. "
+                "Realms: %s",
+                email,
+                list(queryset.values_list("realm_id", flat=True)),
             )
-            user_profile = queryset.order_by("-id").first()
-            if user_profile:
-                cache.set(cache_key, user_profile, USER_PROFILE_CACHE_TIMEOUT)
-            return user_profile
+            return queryset.order_by("-id").first()
 
     def _error_response(self, message: str) -> JsonResponse:
         """Create a standardized error response.

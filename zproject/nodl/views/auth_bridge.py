@@ -7,7 +7,6 @@ from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_POST
 
 from zerver.models import Realm, UserProfile
-from zerver.models.realms import get_realm
 from zproject.nodl.actions import (
     acquire_phone_link_lock,
     check_duplicate_phone,
@@ -28,6 +27,10 @@ from zproject.nodl.auth import JWTValidationError, validate_supabase_jwt
 from zproject.nodl.models import NodlRegistrationPin
 from zproject.nodl.throttle import check_rate_limit
 from zproject.nodl.views.invites import mark_invite_registered
+from zproject.nodl.workspace_resolution import (
+    rank_realms_for_user,
+    resolve_candidate_realms,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +51,11 @@ def auth_bridge(request: HttpRequest) -> JsonResponse:
         Linking available: {"result": "success", "msg": "", "linking_available": true,
                            "existing_email_masked": "m***@example.com", "existing_user_id": 123}
         Duplicate phone: {"result": "success", "msg": "", "duplicate_phone": true}
+        No workspace: {"result": "no_workspace", "msg": "", "code": "NO_WORKSPACE"}
+            (HTTP 200 — a valid state of a valid account; the client shows a
+            waiting-for-invite state)
+        Workspace lookup unavailable: HTTP 503 {"result": "error",
+            "code": "SERVICE_UNAVAILABLE"}
     """
     try:
         return _auth_bridge_inner(request)
@@ -92,36 +100,45 @@ def _auth_bridge_inner(request: HttpRequest) -> JsonResponse:
     supabase_user_id = payload.get("sub", "")
     logger.info("NODL_DEBUG: JWT validated, sub=%s phone=%s", payload.get("sub"), payload.get("phone"))
 
-    # Find realm based on user's workspace membership
-    realm = None
+    # Find realm based on user's workspace membership.  There is deliberately
+    # NO fallback realm: placing (and provisioning!) a user in a realm they
+    # have no membership in is a cross-tenant leak.
     workspace_ids = get_user_workspace_ids(supabase_user_id)
-    for ws_id in workspace_ids:
-        realm_string_id = ws_id[:20].lower()
-        try:
-            realm = get_realm(realm_string_id)
-            logger.info("NODL_DEBUG: realm found via workspace %s, id=%d string_id=%r", ws_id, realm.id, realm.string_id)
-            break
-        except Realm.DoesNotExist:
-            continue
-
-    # Fallback: first active non-internal realm
-    if realm is None:
-        realm = (
-            Realm.objects.exclude(string_id="zulipinternal")
-            .exclude(deactivated=True)
-            .order_by("id")
-            .first()
+    if workspace_ids is None:
+        # The RPC could not be consulted — an operational failure, not a
+        # statement about the user's membership.  Fail loud.
+        logger.error(
+            "NODL_DEBUG: workspace lookup unavailable for sub=%s", supabase_user_id
         )
-
-    if realm is None:
-        logger.error("NODL_DEBUG: No active non-internal realm found")
         return JsonResponse(
-            {"result": "error", "msg": "Realm not found", "code": "INTERNAL_ERROR"},
-            status=500,
+            {
+                "result": "error",
+                "msg": "Workspace lookup unavailable",
+                "code": "SERVICE_UNAVAILABLE",
+            },
+            status=503,
         )
 
-    if not workspace_ids:
-        logger.info("NODL_DEBUG: no workspace membership found, using fallback realm id=%d string_id=%r", realm.id, realm.string_id)
+    candidate_realms = resolve_candidate_realms(workspace_ids)
+    ranked_realms = rank_realms_for_user(candidate_realms, derive_email(payload))
+    if not ranked_realms:
+        logger.info(
+            "NODL_DEBUG: no resolvable workspace for sub=%s (%d workspace ids)",
+            supabase_user_id,
+            len(workspace_ids),
+        )
+        return JsonResponse(
+            {"result": "no_workspace", "msg": "", "code": "NO_WORKSPACE"}
+        )
+
+    realm = ranked_realms[0]
+    logger.info(
+        "NODL_DEBUG: realm resolved for sub=%s: id=%d string_id=%r (of %d candidates)",
+        supabase_user_id,
+        realm.id,
+        realm.string_id,
+        len(ranked_realms),
+    )
 
     # Parse optional link_action from request body
     link_action = None

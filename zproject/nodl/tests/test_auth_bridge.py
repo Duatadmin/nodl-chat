@@ -77,9 +77,40 @@ NODL_SETTINGS = {
     "NODL_SUPABASE_SERVICE_ROLE_KEY": TEST_SERVICE_ROLE_KEY,
 }
 
+# Workspace UUID mapped to the stock "zulip" test realm in AuthBridgeTestBase.
+TEST_WORKSPACE_ID = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+
+
+class AuthBridgeTestBase(ZulipTestCase):
+    """Base for bridge tests: gives the JWT user a resolvable workspace.
+
+    The bridge has no fallback realm — a user with no resolvable workspace
+    gets ``no_workspace``.  Historically these tests relied on the (removed)
+    oldest-realm fallback because the workspace RPC was never patched; now
+    every test runs with the RPC patched to place the user in the stock
+    "zulip" realm via a NodlRealmExtension mapping.  Tests that need a
+    different membership adjust ``self.mock_workspace_ids.return_value``.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        from nodl.extensions.models import NodlRealmExtension
+
+        NodlRealmExtension.objects.get_or_create(
+            zulip_realm=get_realm("zulip"),
+            defaults={"nodl_workspace_id": TEST_WORKSPACE_ID},
+        )
+        # Patch at the view namespace — auth_bridge imports it by name.
+        patcher = mock.patch(
+            "zproject.nodl.views.auth_bridge.get_user_workspace_ids",
+            return_value=[TEST_WORKSPACE_ID],
+        )
+        self.mock_workspace_ids = patcher.start()
+        self.addCleanup(patcher.stop)
+
 
 @override_settings(**NODL_SETTINGS)
-class AuthBridgeNewUserTest(ZulipTestCase):
+class AuthBridgeNewUserTest(AuthBridgeTestBase):
     """Test: valid JWT for new user -> 200 + user created + API key returned (AC #1)"""
 
     def test_valid_jwt_new_user_creates_account(self) -> None:
@@ -117,7 +148,7 @@ class AuthBridgeNewUserTest(ZulipTestCase):
 
 
 @override_settings(**NODL_SETTINGS)
-class AuthBridgeExistingUserTest(ZulipTestCase):
+class AuthBridgeExistingUserTest(AuthBridgeTestBase):
     """Test: valid JWT for existing user -> 200 + same user (AC #2)"""
 
     def test_existing_user_returns_same_api_key(self) -> None:
@@ -150,7 +181,7 @@ class AuthBridgeExistingUserTest(ZulipTestCase):
 
 
 @override_settings(**NODL_SETTINGS)
-class AuthBridgeInvalidJWTTest(ZulipTestCase):
+class AuthBridgeInvalidJWTTest(AuthBridgeTestBase):
     """Test error cases for invalid JWTs (AC #3)"""
 
     def test_expired_jwt_returns_401(self) -> None:
@@ -210,7 +241,7 @@ class AuthBridgeInvalidJWTTest(ZulipTestCase):
 
 
 @override_settings(**NODL_SETTINGS)
-class AuthBridgePhoneValidationTest(ZulipTestCase):
+class AuthBridgePhoneValidationTest(AuthBridgeTestBase):
     """Test E.164 phone validation (H2 fix)."""
 
     def test_invalid_phone_format_returns_400(self) -> None:
@@ -246,7 +277,7 @@ class AuthBridgePhoneValidationTest(ZulipTestCase):
 
 
 @override_settings(**NODL_SETTINGS)
-class AuthBridgeRateLimitTest(ZulipTestCase):
+class AuthBridgeRateLimitTest(AuthBridgeTestBase):
     """Test: rate limiting -> 429 after 10+ rapid requests (AC #5)"""
 
     def test_rate_limit_exceeded_returns_429(self) -> None:
@@ -286,7 +317,7 @@ class AuthBridgeRateLimitTest(ZulipTestCase):
 
 
 @override_settings(**NODL_SETTINGS)
-class AuthBridgeConcurrencyTest(ZulipTestCase):
+class AuthBridgeConcurrencyTest(AuthBridgeTestBase):
     """Test: concurrent requests for same user don't create duplicates (AC #1, #2)"""
 
     def test_concurrent_requests_no_duplicates(self) -> None:
@@ -315,7 +346,7 @@ class AuthBridgeConcurrencyTest(ZulipTestCase):
 
 
 @override_settings(**NODL_SETTINGS)
-class AuthBridgeResponseFormatTest(ZulipTestCase):
+class AuthBridgeResponseFormatTest(AuthBridgeTestBase):
     """Test: response format matches Zulip's structure (AC #1)"""
 
     def test_success_response_format(self) -> None:
@@ -382,7 +413,7 @@ class EmailMaskingTest(ZulipTestCase):
 
 
 @override_settings(**NODL_SETTINGS)
-class AuthBridgeAccountDetectionTest(ZulipTestCase):
+class AuthBridgeAccountDetectionTest(AuthBridgeTestBase):
     """Test account linking detection (Task 1.1-1.3, AC #1)"""
 
     def _create_existing_email_user(self, email: str) -> UserProfile:
@@ -483,7 +514,7 @@ class AuthBridgeAccountDetectionTest(ZulipTestCase):
 
 
 @override_settings(**NODL_SETTINGS)
-class AuthBridgeDuplicatePhoneTest(ZulipTestCase):
+class AuthBridgeDuplicatePhoneTest(AuthBridgeTestBase):
     """Test duplicate phone detection (Task 1.4, AC #4)"""
 
     @mock.patch("zproject.nodl.views.auth_bridge.check_duplicate_phone")
@@ -525,7 +556,7 @@ class AuthBridgeDuplicatePhoneTest(ZulipTestCase):
 
 
 @override_settings(**NODL_SETTINGS)
-class AuthBridgeLinkConfirmationTest(ZulipTestCase):
+class AuthBridgeLinkConfirmationTest(AuthBridgeTestBase):
     """Test link confirmation endpoint (Task 2.1-2.3, AC #2, #3)"""
 
     def _create_existing_email_user(self, email: str) -> UserProfile:
@@ -680,7 +711,7 @@ class AuthBridgeLinkConfirmationTest(ZulipTestCase):
 
 
 @override_settings(**NODL_SETTINGS)
-class AuthBridgeLinkRateLimitTest(ZulipTestCase):
+class AuthBridgeLinkRateLimitTest(AuthBridgeTestBase):
     """Test link attempt rate limiting (Task 2.4)"""
 
     def setUp(self) -> None:
@@ -723,3 +754,157 @@ class AuthBridgeLinkRateLimitTest(ZulipTestCase):
         self.assertEqual(data["result"], "error")
         self.assertEqual(data["code"], "RATE_LIMIT_HIT")
         self.assertIn("Retry-After", result.headers)
+
+
+@override_settings(**NODL_SETTINGS)
+class AuthBridgeWorkspaceResolutionTest(AuthBridgeTestBase):
+    """Deterministic workspace→realm resolution and the no-fallback contract."""
+
+    SECOND_WORKSPACE_ID = "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff"
+
+    def create_second_realm(self) -> "Realm":
+        from nodl.extensions.models import NodlRealmExtension
+        from zerver.actions.create_realm import do_create_realm
+
+        realm = do_create_realm(
+            string_id="secondws",
+            name="Second Workspace",
+            create_zulip_discussion_channel=False,
+        )
+        NodlRealmExtension.objects.create(
+            zulip_realm=realm,
+            nodl_workspace_id=self.SECOND_WORKSPACE_ID,
+        )
+        return realm
+
+    def test_lands_in_membership_realm_not_oldest(self) -> None:
+        """A member of only the second realm lands there, never in realm #1."""
+        second_realm = self.create_second_realm()
+        self.mock_workspace_ids.return_value = [self.SECOND_WORKSPACE_ID]
+
+        token = make_jwt(email="resolution-a@nodl.local", sub="resolution-a-uuid")
+        result = self.client_post(
+            AUTH_BRIDGE_URL, HTTP_AUTHORIZATION=f"Bearer {token}"
+        )
+        self.assertEqual(result.status_code, 200)
+        data = result.json()
+        self.assertEqual(data["result"], "success")
+        user = UserProfile.objects.get(id=data["user_id"])
+        self.assertEqual(user.realm_id, second_realm.id)
+
+    def test_no_workspace_returns_no_workspace_and_creates_no_user(self) -> None:
+        """Empty membership -> no_workspace, and no UserProfile is provisioned."""
+        self.mock_workspace_ids.return_value = []
+        email = "no-workspace-user@nodl.local"
+        before = UserProfile.objects.filter(delivery_email__iexact=email).count()
+
+        token = make_jwt(email=email, sub="no-workspace-uuid")
+        result = self.client_post(
+            AUTH_BRIDGE_URL, HTTP_AUTHORIZATION=f"Bearer {token}"
+        )
+        self.assertEqual(result.status_code, 200)
+        data = result.json()
+        self.assertEqual(data["result"], "no_workspace")
+        self.assertEqual(data["code"], "NO_WORKSPACE")
+        self.assertNotIn("api_key", data)
+        self.assertEqual(
+            UserProfile.objects.filter(delivery_email__iexact=email).count(), before
+        )
+
+    def test_rpc_unavailable_returns_503(self) -> None:
+        """RPC failure (None) is an operational error, not 'no workspaces'."""
+        self.mock_workspace_ids.return_value = None
+
+        token = make_jwt(email="rpc-down@nodl.local", sub="rpc-down-uuid")
+        result = self.client_post(
+            AUTH_BRIDGE_URL, HTTP_AUTHORIZATION=f"Bearer {token}"
+        )
+        self.assertEqual(result.status_code, 503)
+        data = result.json()
+        self.assertEqual(data["result"], "error")
+        self.assertEqual(data["code"], "SERVICE_UNAVAILABLE")
+
+    def test_unresolvable_workspace_is_not_a_fallback(self) -> None:
+        """A workspace id with no matching realm yields no_workspace."""
+        self.mock_workspace_ids.return_value = [
+            "99999999-9999-4999-8999-999999999999"
+        ]
+        token = make_jwt(email="unresolvable@nodl.local", sub="unresolvable-uuid")
+        result = self.client_post(
+            AUTH_BRIDGE_URL, HTTP_AUTHORIZATION=f"Bearer {token}"
+        )
+        self.assertEqual(result.status_code, 200)
+        self.assertEqual(result.json()["result"], "no_workspace")
+
+    def test_prefer_realm_with_existing_profile(self) -> None:
+        """An existing identity beats provisioning a fresh one, regardless of
+        the order the RPC returns workspaces in."""
+        second_realm = self.create_second_realm()
+        email = "prefer-existing@nodl.local"
+        from zerver.actions.create_user import do_create_user
+
+        do_create_user(
+            email=email,
+            password=None,
+            realm=second_realm,
+            full_name="Existing There",
+            acting_user=None,
+        )
+        # RPC lists the zulip-realm workspace FIRST; the second realm must
+        # still win because the profile already exists there.
+        self.mock_workspace_ids.return_value = [
+            TEST_WORKSPACE_ID,
+            self.SECOND_WORKSPACE_ID,
+        ]
+
+        token = make_jwt(email=email, sub="prefer-existing-uuid")
+        result = self.client_post(
+            AUTH_BRIDGE_URL, HTTP_AUTHORIZATION=f"Bearer {token}"
+        )
+        data = result.json()
+        self.assertEqual(data["result"], "success")
+        user = UserProfile.objects.get(id=data["user_id"])
+        self.assertEqual(user.realm_id, second_realm.id)
+
+    def test_message_recency_ranks_between_existing_profiles(self) -> None:
+        """With profiles in two realms, the one with newer messages wins."""
+        second_realm = self.create_second_realm()
+        email = "recency-rank@nodl.local"
+        from zerver.actions.create_user import do_create_user
+
+        zulip_realm_profile = do_create_user(
+            email=email,
+            password=None,
+            realm=get_realm("zulip"),
+            full_name="Recency Zulip",
+            acting_user=None,
+        )
+        second_profile = do_create_user(
+            email=email,
+            password=None,
+            realm=second_realm,
+            full_name="Recency Second",
+            acting_user=None,
+        )
+        # Give the second realm's profile the newer message activity.
+        peer = do_create_user(
+            email="recency-peer@nodl.local",
+            password=None,
+            realm=second_realm,
+            full_name="Peer",
+            acting_user=None,
+        )
+        self.send_personal_message(peer, second_profile)
+        assert zulip_realm_profile is not None  # unused message-side, ranking only
+
+        self.mock_workspace_ids.return_value = [
+            TEST_WORKSPACE_ID,
+            self.SECOND_WORKSPACE_ID,
+        ]
+        token = make_jwt(email=email, sub="recency-rank-uuid")
+        result = self.client_post(
+            AUTH_BRIDGE_URL, HTTP_AUTHORIZATION=f"Bearer {token}"
+        )
+        data = result.json()
+        self.assertEqual(data["result"], "success")
+        self.assertEqual(data["user_id"], second_profile.id)

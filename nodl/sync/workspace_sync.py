@@ -8,9 +8,11 @@ from django.utils import timezone
 
 from nodl.extensions.models import NodlRealmExtension, SyncStatus
 from zerver.actions.create_realm import do_create_realm
+from zerver.actions.default_streams import do_add_default_stream
 from zerver.actions.realm_settings import do_deactivate_realm
+from zerver.actions.streams import bulk_add_subscriptions
 from zerver.lib.streams import ensure_stream
-from zerver.models import Realm
+from zerver.models import Realm, Stream, Subscription, UserProfile
 
 logger = logging.getLogger(__name__)
 
@@ -198,24 +200,28 @@ class WorkspaceSyncService:
                 realm.id,
             )
 
-    def _create_default_stream(self, realm: Realm) -> None:
-        """Create #general stream for new realm.
+    def _create_default_stream(self, realm: Realm) -> Stream:
+        """Create #general stream for new realm and register it as a
+        DefaultStream, so every user provisioned later (bridge, user sync)
+        is auto-subscribed by Zulip's own new-user path.
 
         Args:
             realm: Zulip realm to create stream in.
         """
-        ensure_stream(
+        stream = ensure_stream(
             realm=realm,
             stream_name="general",
             invite_only=False,
             stream_description="General discussion",
             acting_user=None,
         )
+        do_add_default_stream(stream)
 
         logger.info(
             "Created default #general stream for realm %d",
             realm.id,
         )
+        return stream
 
     def sync_workspace_members(self, realm: Realm, members: list[dict]) -> None:
         """Sync workspace members to realm.
@@ -231,6 +237,7 @@ class WorkspaceSyncService:
 
         user_sync_service = UserSyncService()
 
+        synced_user_ids: list[int] = []
         for member in members:
             sync_request = UserSyncRequest(
                 supabase_user_id=member["supabase_user_id"],
@@ -250,6 +257,61 @@ class WorkspaceSyncService:
                     realm.id,
                     result.error,
                 )
+            elif result.zulip_user_id is not None:
+                synced_user_ids.append(result.zulip_user_id)
+
+        self._ensure_general_subscriptions(realm, synced_user_ids)
+
+    def _ensure_general_subscriptions(self, realm: Realm, user_ids: list[int]) -> None:
+        """Subscribe the given users to the realm's #general stream.
+
+        Also registers #general as a DefaultStream, backfilling realms
+        created before that behavior existed.  Never fails the sync.
+        """
+        if not user_ids:
+            return
+        try:
+            stream = ensure_stream(
+                realm=realm,
+                stream_name="general",
+                invite_only=False,
+                stream_description="General discussion",
+                acting_user=None,
+            )
+            do_add_default_stream(stream)
+
+            already_subscribed = set(
+                Subscription.objects.filter(
+                    user_profile_id__in=user_ids,
+                    recipient=stream.recipient,
+                    active=True,
+                ).values_list("user_profile_id", flat=True)
+            )
+            to_subscribe = list(
+                UserProfile.objects.filter(
+                    id__in=[uid for uid in user_ids if uid not in already_subscribed],
+                    is_active=True,
+                    realm=realm,
+                )
+            )
+            if to_subscribe:
+                bulk_add_subscriptions(
+                    realm,
+                    [stream],
+                    to_subscribe,
+                    from_user_creation=True,
+                    acting_user=None,
+                )
+                logger.info(
+                    "Subscribed %d members to #general in realm %d",
+                    len(to_subscribe),
+                    realm.id,
+                )
+        except Exception:
+            logger.exception(
+                "Failed to ensure #general subscriptions for realm %d (sync continues)",
+                realm.id,
+            )
 
     def deactivate_realm(self, nodl_workspace_id: str) -> WorkspaceSyncResult:
         """Deactivate (soft delete) a realm for a deleted workspace.

@@ -112,16 +112,23 @@ def get_supabase_user_by_email(email: str) -> dict[str, Any] | None:
         return None
 
 
-def get_user_workspace_ids(supabase_user_id: str) -> list[str]:
+def get_user_workspace_ids(supabase_user_id: str) -> list[str] | None:
     """Query workspace IDs via Supabase RPC function (SECURITY DEFINER).
 
-    Uses the RPC endpoint to call get_user_workspace_ids() which bypasses RLS,
-    allowing this to work with the anon key (auth.uid() would be NULL for
-    server-to-server calls, so direct table queries return no rows).
+    The RPC's EXECUTE was revoked from anon/authenticated/public by
+    nodl-backend migration 20260505_security_advisor_fixes.sql, so this only
+    works with the service_role key (NODL_SUPABASE_SERVICE_ROLE_KEY).
+
+    Returns:
+        A list of workspace UUID strings — possibly empty, meaning the user
+        genuinely has no workspace membership — or None when the RPC could
+        not be consulted (missing config, non-200, network failure).  Callers
+        must treat None as "unknown", never as "no workspaces".
     """
     supabase_url = getattr(settings, "NODL_SUPABASE_URL", "")
     if not supabase_url:
-        return []
+        logger.error("NODL_SUPABASE_URL is not configured; cannot resolve workspaces")
+        return None
     url = f"{supabase_url.rstrip('/')}/rest/v1/rpc/get_user_workspace_ids"
     try:
         resp = requests.post(
@@ -135,16 +142,22 @@ def get_user_workspace_ids(supabase_user_id: str) -> list[str]:
             data = resp.json()
             if isinstance(data, list):
                 return [str(ws_id) for ws_id in data]
-            return []
-        logger.warning(
-            "Supabase RPC get_user_workspace_ids returned %d for user %s",
+            logger.error(
+                "Supabase RPC get_user_workspace_ids returned unexpected shape %s for user %s",
+                type(data).__name__,
+                supabase_user_id,
+            )
+            return None
+        logger.error(
+            "Supabase RPC get_user_workspace_ids returned %d for user %s"
+            " (401 here almost always means SUPABASE_KEY is not the service_role key)",
             resp.status_code,
             supabase_user_id,
         )
-        return []
+        return None
     except requests.RequestException:
         logger.exception("Failed to query workspace_ids for user %s", supabase_user_id)
-        return []
+        return None
 
 
 def find_email_identity(supabase_user: dict[str, Any]) -> str | None:
