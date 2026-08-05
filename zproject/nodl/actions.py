@@ -190,11 +190,23 @@ def find_existing_zulip_user_by_email(email: str, realm: Realm) -> UserProfile |
 def check_duplicate_phone(supabase_user_id: str, phone: str) -> bool:
     """Check if a phone number is already linked to a different Supabase user.
 
-    Queries Supabase Admin API to find users with this phone number.
-    Returns True if the phone belongs to a different user.
+    GoTrue enforces phone uniqueness (an OTP to an existing phone logs into
+    that user rather than creating a new one), so a genuine cross-user
+    duplicate is structurally impossible; this remains as a belt-and-braces
+    guard only.
+
+    The admin list-users endpoint ignores a ``phone`` query param and this
+    project's GoTrue version doesn't match phones via ``filter`` either, so
+    the results MUST be compared by actual phone value — treating "any other
+    user came back" as a duplicate flags every registration once the admin
+    key works (it silently 401'd on the anon key for months).
     """
     supabase_url = getattr(settings, "NODL_SUPABASE_URL", "")
     if not supabase_url:
+        return False
+
+    target = re.sub(r"\D", "", phone)
+    if not target:
         return False
 
     url = f"{supabase_url.rstrip('/')}/auth/v1/admin/users"
@@ -202,7 +214,7 @@ def check_duplicate_phone(supabase_user_id: str, phone: str) -> bool:
         resp = requests.get(
             url,
             headers=get_supabase_admin_headers(),
-            params={"phone": phone, "per_page": "5"},
+            params={"filter": phone, "per_page": "10"},
             timeout=10,
         )
         if resp.status_code != 200:
@@ -212,7 +224,16 @@ def check_duplicate_phone(supabase_user_id: str, phone: str) -> bool:
         if not isinstance(users, list):
             return False
         for user in users:
-            if isinstance(user, dict) and user.get("id") != supabase_user_id:
+            if (
+                isinstance(user, dict)
+                and user.get("id") != supabase_user_id
+                and re.sub(r"\D", "", user.get("phone") or "") == target
+            ):
+                logger.warning(
+                    "Duplicate phone across Supabase users: %s also on user %s",
+                    phone,
+                    user.get("id"),
+                )
                 return True
         return False
     except requests.RequestException:
