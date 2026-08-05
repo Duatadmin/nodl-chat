@@ -78,7 +78,13 @@ def get_supabase_user_by_id(supabase_user_id: str) -> dict[str, Any] | None:
 def get_supabase_user_by_email(email: str) -> dict[str, Any] | None:
     """Look up a Supabase user by email via the Admin list-users API.
 
-    Returns the first user whose email matches, or None.
+    This GoTrue's admin endpoint IGNORES an ``email`` query param (verified
+    live 2026-08-05: it returns an arbitrary page with the param silently
+    dropped, the same trap as the ``phone`` param in check_duplicate_phone).
+    ``filter`` DOES match emails, so we filter server-side and still compare
+    exact values before trusting a hit.
+
+    Returns the user whose email matches exactly, or None.
     """
     supabase_url = getattr(settings, "NODL_SUPABASE_URL", "")
     if not supabase_url:
@@ -90,7 +96,7 @@ def get_supabase_user_by_email(email: str) -> dict[str, Any] | None:
         resp = requests.get(
             url,
             headers=get_supabase_admin_headers(),
-            params={"email": email, "per_page": "5"},
+            params={"filter": email, "per_page": "10"},
             timeout=10,
         )
         if resp.status_code != 200:
