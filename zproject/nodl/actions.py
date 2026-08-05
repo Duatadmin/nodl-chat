@@ -113,6 +113,60 @@ def get_supabase_user_by_email(email: str) -> dict[str, Any] | None:
         return None
 
 
+def get_supabase_user_by_phone(phone: str) -> dict[str, Any] | None:
+    """Look up a Supabase user by phone via the Admin list-users API.
+
+    The admin endpoint cannot filter by phone (the ``phone`` query param is
+    ignored, and this GoTrue's ``filter`` doesn't match phone values — see
+    check_duplicate_phone), so this pages through users and compares
+    digits-only phone values.  Capped at a small page count; fine at nodl's
+    user scale, not a general-purpose search.
+    """
+    supabase_url = getattr(settings, "NODL_SUPABASE_URL", "")
+    if not supabase_url:
+        logger.error("NODL_SUPABASE_URL is not configured")
+        return None
+
+    target = re.sub(r"\D", "", phone)
+    if not target:
+        return None
+
+    url = f"{supabase_url.rstrip('/')}/auth/v1/admin/users"
+    max_pages = 10
+    try:
+        for page in range(1, max_pages + 1):
+            resp = requests.get(
+                url,
+                headers=get_supabase_admin_headers(),
+                params={"page": str(page), "per_page": "100"},
+                timeout=10,
+            )
+            if resp.status_code != 200:
+                logger.warning(
+                    "Supabase admin API returned %d listing users (page %d)",
+                    resp.status_code,
+                    page,
+                )
+                return None
+            data = resp.json()
+            users = data.get("users", data) if isinstance(data, dict) else data
+            if not isinstance(users, list) or not users:
+                return None
+            for user in users:
+                if isinstance(user, dict) and re.sub(r"\D", "", user.get("phone") or "") == target:
+                    return user
+            if len(users) < 100:
+                return None
+        logger.warning(
+            "Phone lookup exhausted %d pages without a match; user base has outgrown paging search",
+            max_pages,
+        )
+        return None
+    except requests.RequestException:
+        logger.exception("Failed to look up Supabase user by phone")
+        return None
+
+
 def get_user_workspace_ids(supabase_user_id: str) -> list[str] | None:
     """Query workspace IDs via Supabase RPC function (SECURITY DEFINER).
 
