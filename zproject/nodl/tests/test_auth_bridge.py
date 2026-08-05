@@ -429,12 +429,15 @@ class AuthBridgeAccountDetectionTest(AuthBridgeTestBase):
 
     @mock.patch("zproject.nodl.views.auth_bridge.check_duplicate_phone")
     @mock.patch("zproject.nodl.views.auth_bridge.get_supabase_user_by_id")
-    def test_linking_available_when_email_identity_matches(
+    def test_auto_link_when_email_identity_matches(
         self,
         mock_get_user: mock.MagicMock,
         mock_check_dup: mock.MagicMock,
     ) -> None:
-        """When phone user has email identity matching a Zulip user, return linking_available."""
+        """When the phone user's email identity matches a Zulip user, log
+        straight into that profile (auto-link) instead of asking the client
+        to confirm — Supabase already asserts both identities are one human,
+        and the old confirm handshake never worked end-to-end."""
         existing_user = self._create_existing_email_user("marcus@example.com")
         mock_check_dup.return_value = False
         mock_get_user.return_value = make_supabase_user(
@@ -453,11 +456,18 @@ class AuthBridgeAccountDetectionTest(AuthBridgeTestBase):
         self.assertEqual(result.status_code, 200)
         data = result.json()
         self.assertEqual(data["result"], "success")
-        self.assertTrue(data["linking_available"])
-        self.assertEqual(data["existing_email_masked"], "m***@example.com")
-        self.assertEqual(data["existing_user_id"], existing_user.id)
-        # Should NOT contain api_key (linking not confirmed yet)
-        self.assertNotIn("api_key", data)
+        self.assertEqual(data["api_key"], existing_user.api_key)
+        self.assertEqual(data["user_id"], existing_user.id)
+        self.assertEqual(data["email"], existing_user.delivery_email)
+        self.assertEqual(data["linked_email_masked"], "m***@example.com")
+        self.assertTrue(data["is_new_device"])
+        # No second profile was provisioned for the phone-derived email.
+        realm = get_realm("zulip")
+        self.assertFalse(
+            UserProfile.objects.filter(
+                realm=realm, delivery_email__iexact="15557777777@nodl.local"
+            ).exists()
+        )
 
     @mock.patch("zproject.nodl.views.auth_bridge.check_duplicate_phone")
     @mock.patch("zproject.nodl.views.auth_bridge.get_supabase_user_by_id")

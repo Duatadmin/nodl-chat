@@ -176,23 +176,41 @@ def _auth_bridge_inner(request: HttpRequest) -> JsonResponse:
     if phone and check_duplicate_phone(supabase_user_id, phone):
         return JsonResponse({"result": "success", "msg": "", "duplicate_phone": True})
 
-    # Check if the phone user has an email identity in Supabase
+    # If this Supabase user also carries an email identity and a Zulip user
+    # with that email already exists in the resolved realm, log straight into
+    # that profile (auto-link). Supabase has already authenticated this human
+    # and asserts both identities belong to the same account, so a separate
+    # confirmation step adds no security. (The old interactive linking
+    # handshake was broken end-to-end anyway: the confirm endpoint was never
+    # registered in urls.py and shipped clients parse different JSON keys, so
+    # returning `linking_available` without an api_key just hung the client's
+    # registration spinner.)
     logger.info("NODL_DEBUG: checking supabase user, id=%s", supabase_user_id)
     if supabase_user_id:
         supabase_user = get_supabase_user_by_id(supabase_user_id)
         if supabase_user is not None:
             existing_email = find_email_identity(supabase_user)
             if existing_email:
-                # Check if a Zulip user exists with that email
                 existing_zulip_user = find_existing_zulip_user_by_email(existing_email, realm)
                 if existing_zulip_user is not None:
+                    logger.info(
+                        "NODL_DEBUG: auto-linking to existing user %d (%s) in realm %d",
+                        existing_zulip_user.id,
+                        mask_email(existing_email),
+                        realm.id,
+                    )
                     return JsonResponse(
                         {
                             "result": "success",
                             "msg": "",
-                            "linking_available": True,
-                            "existing_email_masked": mask_email(existing_email),
-                            "existing_user_id": existing_zulip_user.id,
+                            "api_key": existing_zulip_user.api_key,
+                            "user_id": existing_zulip_user.id,
+                            "email": existing_zulip_user.delivery_email,
+                            "has_pin": NodlRegistrationPin.objects.filter(
+                                user=existing_zulip_user
+                            ).exists(),
+                            "is_new_device": True,
+                            "linked_email_masked": mask_email(existing_email),
                         }
                     )
 
