@@ -148,10 +148,14 @@ class TestMemberSync(TestCase):
         """Set up test fixtures."""
         self.service = WorkspaceSyncService()
 
+    @patch.object(WorkspaceSyncService, "_deactivate_removed_members")
     @patch.object(WorkspaceSyncService, "_ensure_general_subscriptions")
     @patch("nodl.sync.workspace_sync.UserSyncService")
     def test_sync_workspace_members(
-        self, mock_user_sync_service: MagicMock, mock_ensure_general: MagicMock
+        self,
+        mock_user_sync_service: MagicMock,
+        mock_ensure_general: MagicMock,
+        mock_deactivate_removed: MagicMock,
     ) -> None:
         """Test member sync calls UserSyncService for each member."""
         mock_instance = MagicMock()
@@ -183,11 +187,16 @@ class TestMemberSync(TestCase):
         # were handed to the #general subscription pass
         self.assertEqual(mock_instance.sync_user.call_count, 2)
         mock_ensure_general.assert_called_once_with(mock_realm, [1, 1])
+        mock_deactivate_removed.assert_called_once_with(mock_realm, members)
 
+    @patch.object(WorkspaceSyncService, "_deactivate_removed_members")
     @patch.object(WorkspaceSyncService, "_ensure_general_subscriptions")
     @patch("nodl.sync.workspace_sync.UserSyncService")
     def test_member_sync_continues_on_failure(
-        self, mock_user_sync_service: MagicMock, mock_ensure_general: MagicMock
+        self,
+        mock_user_sync_service: MagicMock,
+        mock_ensure_general: MagicMock,
+        mock_deactivate_removed: MagicMock,
     ) -> None:
         """Test member sync continues even if one member fails."""
         mock_instance = MagicMock()
@@ -423,3 +432,149 @@ class TestEnsureGeneralSubscriptions(TestCase):
         service = WorkspaceSyncService()
         service._ensure_general_subscriptions(realm, [])
         self.assertFalse(Stream.objects.filter(realm=realm, name="general").exists())
+
+
+class TestDeactivateRemovedMembers(TestCase):
+    """Real-DB tests for member-removal reconciliation.
+
+    A removed member's api_key keeps authenticating until their realm
+    profile is deactivated — the reconciliation pass closes that hole.
+    """
+
+    def _make_realm(self):
+        from zerver.actions.create_realm import do_create_realm
+
+        return do_create_realm(
+            string_id=f"removal{uuid.uuid4().hex[:8]}",
+            name="Removal Test",
+            create_zulip_discussion_channel=False,
+        )
+
+    def _make_mapped_user(self, realm, email, supabase_id):
+        from nodl.extensions.mapping import record_realm_user_mapping
+        from zerver.actions.create_user import do_create_user
+
+        user = do_create_user(
+            email=email,
+            password=None,
+            realm=realm,
+            full_name="Removal User",
+            acting_user=None,
+        )
+        assert record_realm_user_mapping(realm, user, supabase_id) is not None
+        return user
+
+    def test_absent_member_is_deactivated(self) -> None:
+        realm = self._make_realm()
+        kept_id, removed_id = uuid.uuid4(), uuid.uuid4()
+        kept = self._make_mapped_user(realm, "kept@example.com", kept_id)
+        removed = self._make_mapped_user(realm, "removed@example.com", removed_id)
+
+        WorkspaceSyncService()._deactivate_removed_members(
+            realm,
+            [{"supabase_user_id": str(kept_id), "email": "kept@example.com", "role": "editor"}],
+        )
+
+        kept.refresh_from_db()
+        removed.refresh_from_db()
+        self.assertTrue(kept.is_active)
+        self.assertFalse(removed.is_active)
+
+    def test_empty_member_list_never_mass_deactivates(self) -> None:
+        realm = self._make_realm()
+        user = self._make_mapped_user(realm, "safe@example.com", uuid.uuid4())
+
+        WorkspaceSyncService()._deactivate_removed_members(realm, [])
+
+        user.refresh_from_db()
+        self.assertTrue(user.is_active)
+
+    def test_unparseable_member_id_skips_reconciliation(self) -> None:
+        realm = self._make_realm()
+        user = self._make_mapped_user(realm, "guarded@example.com", uuid.uuid4())
+
+        WorkspaceSyncService()._deactivate_removed_members(
+            realm,
+            [{"supabase_user_id": "not-a-uuid", "email": "x@example.com", "role": "editor"}],
+        )
+
+        user.refresh_from_db()
+        self.assertTrue(user.is_active)
+
+    def test_unmapped_profile_untouched(self) -> None:
+        """A profile with no mapping row has unknown identity — never guessed."""
+        from zerver.actions.create_user import do_create_user
+
+        realm = self._make_realm()
+        unmapped = do_create_user(
+            email="unmapped@example.com",
+            password=None,
+            realm=realm,
+            full_name="Unmapped",
+            acting_user=None,
+        )
+
+        WorkspaceSyncService()._deactivate_removed_members(
+            realm,
+            [
+                {
+                    "supabase_user_id": str(uuid.uuid4()),
+                    "email": "other@example.com",
+                    "role": "editor",
+                }
+            ],
+        )
+
+        unmapped.refresh_from_db()
+        self.assertTrue(unmapped.is_active)
+
+
+class TestReAddedMemberReactivation(TestCase):
+    """sync_user resurrects a deactivated profile for a re-added member."""
+
+    def _fixture(self):
+        from zerver.actions.create_realm import do_create_realm
+        from zerver.actions.create_user import do_create_user
+        from zerver.actions.users import do_deactivate_user
+
+        ws_uuid = uuid.uuid4()
+        realm = do_create_realm(
+            string_id=str(ws_uuid)[:20].lower(),
+            name="Readd Test",
+            create_zulip_discussion_channel=False,
+        )
+        NodlRealmExtension.objects.create(
+            zulip_realm=realm,
+            nodl_workspace_id=ws_uuid,
+            sync_status=SyncStatus.SYNCED,
+        )
+        user = do_create_user(
+            email="readd@example.com",
+            password=None,
+            realm=realm,
+            full_name="Re Added",
+            acting_user=None,
+        )
+        do_deactivate_user(user, acting_user=None)
+        return realm, ws_uuid, user
+
+    def test_sync_user_reactivates_deactivated_profile(self) -> None:
+        from nodl.sync.user_sync import UserSyncRequest, UserSyncService
+
+        realm, ws_uuid, user = self._fixture()
+
+        result = UserSyncService().sync_user(
+            UserSyncRequest(
+                supabase_user_id=str(uuid.uuid4()),
+                email="readd@example.com",
+                full_name="Re Added",
+                avatar_url=None,
+                workspace_id=str(ws_uuid),
+                role="editor",
+            )
+        )
+
+        self.assertTrue(result.success, result.error)
+        user.refresh_from_db()
+        self.assertTrue(user.is_active)
+        self.assertEqual(result.zulip_user_id, user.id)

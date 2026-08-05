@@ -9,7 +9,7 @@ from django.utils import timezone
 
 from nodl.extensions.mapping import record_realm_user_mapping
 from nodl.extensions.models import NodlRealmExtension, NodlUserExtension, SyncStatus
-from zerver.actions.create_user import do_create_user
+from zerver.actions.create_user import do_create_user, do_reactivate_user
 from zerver.actions.user_settings import do_change_full_name
 from zerver.actions.users import do_change_user_role
 from zerver.models import Realm, UserProfile
@@ -119,6 +119,15 @@ class UserSyncService:
                     raise ValueError(f"Realm not found for workspace {request.workspace_id}")
 
                 if extension.zulip_user and extension.zulip_user.realm_id == realm.id:
+                    if not extension.zulip_user.is_active:
+                        # Removed member re-added: this sync is authoritative
+                        # membership, so resurrect the profile.
+                        do_reactivate_user(extension.zulip_user, acting_user=None)
+                        logger.info(
+                            "Reactivated linked Zulip user %d for re-added member %s",
+                            extension.zulip_user.id,
+                            request.supabase_user_id,
+                        )
                     user = self._update_user(extension.zulip_user, request, realm)
                 else:
                     # Check if user already exists in this realm (created via workspace sync)
@@ -128,6 +137,25 @@ class UserSyncService:
                         delivery_email__iexact=request.email,
                         is_active=True,
                     ).first()
+
+                    if existing_user is None:
+                        # A member removed and later re-added has a deactivated
+                        # profile holding the email (unique per realm) — only
+                        # this authoritative sync path may resurrect it.
+                        deactivated_user = UserProfile.objects.filter(
+                            realm=realm,
+                            delivery_email__iexact=request.email,
+                            is_active=False,
+                            is_bot=False,
+                        ).first()
+                        if deactivated_user is not None:
+                            do_reactivate_user(deactivated_user, acting_user=None)
+                            logger.info(
+                                "Reactivated Zulip user %d for re-added member %s",
+                                deactivated_user.id,
+                                request.supabase_user_id,
+                            )
+                            existing_user = deactivated_user
 
                     if existing_user:
                         # Check if this user is already linked to another extension

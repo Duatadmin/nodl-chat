@@ -6,11 +6,12 @@ from dataclasses import dataclass
 
 from django.utils import timezone
 
-from nodl.extensions.models import NodlRealmExtension, SyncStatus
+from nodl.extensions.models import NodlRealmExtension, NodlRealmUserExtension, SyncStatus
 from zerver.actions.create_realm import do_create_realm
 from zerver.actions.default_streams import do_add_default_stream
 from zerver.actions.realm_settings import do_deactivate_realm
 from zerver.actions.streams import bulk_add_subscriptions
+from zerver.actions.users import do_deactivate_user
 from zerver.lib.streams import ensure_stream
 from zerver.models import Realm, Stream, Subscription, UserProfile
 
@@ -261,6 +262,59 @@ class WorkspaceSyncService:
                 synced_user_ids.append(result.zulip_user_id)
 
         self._ensure_general_subscriptions(realm, synced_user_ids)
+        self._deactivate_removed_members(realm, members)
+
+    def _deactivate_removed_members(self, realm: Realm, members: list[dict]) -> None:
+        """Deactivate realm profiles of humans absent from the member list.
+
+        The member list is the workspace's authoritative membership; a
+        removed member's api_key keeps authenticating until their realm
+        profile is deactivated — lasting access to a workspace they were
+        removed from.
+
+        Guards: an empty member list is treated as a broken payload and
+        skipped (never mass-deactivate); only mapped profiles are considered
+        (an unmapped profile's identity is unknown — never guessed); bots are
+        untouched.  Failures never fail the sync.
+        """
+        if not members:
+            return
+        expected: set[uuid.UUID] = set()
+        for member in members:
+            try:
+                expected.add(uuid.UUID(str(member["supabase_user_id"])))
+            except (KeyError, TypeError, ValueError):
+                # One unparseable member must not cause removals below.
+                logger.warning(
+                    "Member with unusable supabase_user_id in realm %d sync; "
+                    "skipping removal reconciliation",
+                    realm.id,
+                )
+                return
+        stale_mappings = (
+            NodlRealmUserExtension.objects.select_related("zulip_user")
+            .filter(
+                zulip_realm=realm,
+                zulip_user__is_active=True,
+                zulip_user__is_bot=False,
+            )
+            .exclude(supabase_user_id__in=expected)
+        )
+        for mapping in stale_mappings:
+            try:
+                do_deactivate_user(mapping.zulip_user, acting_user=None)
+                logger.info(
+                    "Deactivated removed member: profile %d (supabase %s) in realm %d",
+                    mapping.zulip_user_id,
+                    mapping.supabase_user_id,
+                    realm.id,
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to deactivate removed member profile %d in realm %d",
+                    mapping.zulip_user_id,
+                    realm.id,
+                )
 
     def _ensure_general_subscriptions(self, realm: Realm, user_ids: list[int]) -> None:
         """Subscribe the given users to the realm's #general stream.
