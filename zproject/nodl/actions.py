@@ -7,6 +7,7 @@ from django.conf import settings
 from django.core.cache import cache
 from django.db import IntegrityError
 
+from nodl.extensions.mapping import record_realm_user_mapping
 from zerver.actions.create_user import do_create_user
 from zerver.models import Realm, UserProfile
 
@@ -360,36 +361,39 @@ def get_or_create_zulip_user(supabase_payload: dict, realm: Realm) -> UserProfil
 
     # Try to find existing user
     try:
-        return UserProfile.objects.get(
+        user_profile = UserProfile.objects.get(
             delivery_email__iexact=email,
             realm=realm,
             is_active=True,
         )
     except UserProfile.DoesNotExist:
-        pass
+        user_profile = None
 
-    # User does not exist - create one
-    full_name = derive_full_name(supabase_payload)
+    if user_profile is None:
+        # User does not exist - create one
+        full_name = derive_full_name(supabase_payload)
 
-    try:
-        user_profile = do_create_user(
-            email=email,
-            password=None,
-            realm=realm,
-            full_name=full_name,
-            acting_user=None,
-        )
-        logger.info(
-            "Created Zulip user %s (id=%d) for Supabase user %s",
-            email,
-            user_profile.id,
-            supabase_payload.get("sub", "unknown"),
-        )
-        return user_profile
-    except IntegrityError:
-        # Race condition: another request created the user concurrently
-        logger.info("Race condition on user creation for %s, fetching existing", email)
-        return UserProfile.objects.get(
-            delivery_email__iexact=email,
-            realm=realm,
-        )
+        try:
+            user_profile = do_create_user(
+                email=email,
+                password=None,
+                realm=realm,
+                full_name=full_name,
+                acting_user=None,
+            )
+            logger.info(
+                "Created Zulip user %s (id=%d) for Supabase user %s",
+                email,
+                user_profile.id,
+                supabase_payload.get("sub", "unknown"),
+            )
+        except IntegrityError:
+            # Race condition: another request created the user concurrently
+            logger.info("Race condition on user creation for %s, fetching existing", email)
+            user_profile = UserProfile.objects.get(
+                delivery_email__iexact=email,
+                realm=realm,
+            )
+
+    record_realm_user_mapping(realm, user_profile, supabase_payload.get("sub"))
+    return user_profile

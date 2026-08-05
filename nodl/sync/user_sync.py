@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from django.db import transaction
 from django.utils import timezone
 
+from nodl.extensions.mapping import record_realm_user_mapping
 from nodl.extensions.models import NodlRealmExtension, NodlUserExtension, SyncStatus
 from zerver.actions.create_user import do_create_user
 from zerver.actions.user_settings import do_change_full_name
@@ -167,6 +168,11 @@ class UserSyncService:
                     else:
                         user = self._create_user(request, realm)
                         extension.zulip_user = user
+
+                # Keyed on the realm object resolved above — callers pass a
+                # truncated string_id as workspace_id, which must never leak
+                # into the per-realm mapping.
+                record_realm_user_mapping(realm, user, supabase_uuid)
 
                 extension.sync_status = SyncStatus.SYNCED
                 extension.sync_error = None

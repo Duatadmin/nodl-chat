@@ -13,7 +13,7 @@ from unittest.mock import MagicMock, patch
 
 from django.test import TestCase
 
-from nodl.extensions.models import NodlRealmExtension, SyncStatus
+from nodl.extensions.models import NodlRealmExtension, NodlRealmUserExtension, SyncStatus
 from nodl.sync.user_sync import UserSyncRequest, UserSyncResult, UserSyncService
 from zerver.actions.create_realm import do_create_realm
 from zerver.models import Realm, UserProfile
@@ -160,6 +160,32 @@ class TestGetRealmForWorkspace(TestCase):
 
         self.assertTrue(result.success, result.error)
         self.assertIsNotNone(result.zulip_user_id)
+
+    def test_sync_user_records_realm_user_mapping(self) -> None:
+        """sync_user writes the per-realm mapping keyed on the resolved realm.
+
+        Callers pass a truncated string_id as workspace_id; the mapping must
+        still be recorded against the actual Realm (bridge v2 reads it).
+        """
+        ws_uuid = uuid.uuid4()
+        realm = self._make_realm(ws_uuid)
+        supabase_id = uuid.uuid4()
+
+        request = UserSyncRequest(
+            supabase_user_id=str(supabase_id),
+            email=f"mapped-{uuid.uuid4().hex[:8]}@example.com",
+            full_name="Mapped Member",
+            avatar_url=None,
+            workspace_id=realm.string_id,  # truncated legacy form
+            role="editor",
+        )
+
+        result = UserSyncService().sync_user(request)
+
+        self.assertTrue(result.success, result.error)
+        mapping = NodlRealmUserExtension.objects.get(supabase_user_id=supabase_id)
+        self.assertEqual(mapping.zulip_realm_id, realm.id)
+        self.assertEqual(mapping.zulip_user_id, result.zulip_user_id)
 
 
 class TestUserSyncRequest(TestCase):

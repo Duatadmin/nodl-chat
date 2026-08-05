@@ -11,6 +11,7 @@ from django.views.decorators.csrf import csrf_exempt
 from pydantic import BaseModel, Field, ValidationError
 
 from nodl.api.views.internal import require_service_auth
+from nodl.extensions.mapping import record_realm_user_mapping
 from nodl.extensions.models import (
     NodlRealmExtension,
     NodlRealmUserExtension,
@@ -132,11 +133,7 @@ def _resolve_realm_user(realm: Realm, member: TaskStreamMemberPayload) -> UserPr
             ),
         )
 
-    NodlRealmUserExtension.objects.update_or_create(
-        zulip_realm=realm,
-        supabase_user_id=supabase_uuid,
-        defaults={"zulip_user": user, "last_synced_at": timezone.now()},
-    )
+    record_realm_user_mapping(realm, user, supabase_uuid)
     return user
 
 

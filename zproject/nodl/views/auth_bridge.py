@@ -6,6 +6,7 @@ from django.http import HttpRequest, JsonResponse
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_POST
 
+from nodl.extensions.mapping import record_realm_user_mapping
 from zerver.models import Realm, UserProfile
 from zproject.nodl.actions import (
     acquire_phone_link_lock,
@@ -199,6 +200,7 @@ def _auth_bridge_inner(request: HttpRequest) -> JsonResponse:
                         mask_email(existing_email),
                         realm.id,
                     )
+                    record_realm_user_mapping(realm, existing_zulip_user, supabase_user_id)
                     return JsonResponse(
                         {
                             "result": "success",
@@ -386,6 +388,10 @@ def _handle_link(
                 },
                 status=500,
             )
+
+    # The phone identity now lives on the email user's Supabase account, so
+    # that account is the one this profile realizes.
+    record_realm_user_mapping(realm, existing_zulip_user, existing_supabase_id)
 
     return JsonResponse(
         {
