@@ -58,6 +58,9 @@ def auth_bridge(request: HttpRequest) -> JsonResponse:
         Workspace lookup unavailable: HTTP 503 {"result": "error",
             "code": "SERVICE_UNAVAILABLE"}
     """
+    # v1 usage counter: retire v1 once this stays at zero for a release cycle
+    # (bridge v2 is the replacement).
+    logger.info("nodl_bridge_v1_call")
     try:
         return _auth_bridge_inner(request)
     except Exception:
@@ -99,7 +102,9 @@ def _auth_bridge_inner(request: HttpRequest) -> JsonResponse:
         )
 
     supabase_user_id = payload.get("sub", "")
-    logger.info("NODL_DEBUG: JWT validated, sub=%s phone=%s", payload.get("sub"), payload.get("phone"))
+    logger.info(
+        "NODL_DEBUG: JWT validated, sub=%s phone=%s", payload.get("sub"), payload.get("phone")
+    )
 
     # Find realm based on user's workspace membership.  There is deliberately
     # NO fallback realm: placing (and provisioning!) a user in a realm they
@@ -108,9 +113,7 @@ def _auth_bridge_inner(request: HttpRequest) -> JsonResponse:
     if workspace_ids is None:
         # The RPC could not be consulted — an operational failure, not a
         # statement about the user's membership.  Fail loud.
-        logger.error(
-            "NODL_DEBUG: workspace lookup unavailable for sub=%s", supabase_user_id
-        )
+        logger.error("NODL_DEBUG: workspace lookup unavailable for sub=%s", supabase_user_id)
         return JsonResponse(
             {
                 "result": "error",
@@ -128,9 +131,7 @@ def _auth_bridge_inner(request: HttpRequest) -> JsonResponse:
             supabase_user_id,
             len(workspace_ids),
         )
-        return JsonResponse(
-            {"result": "no_workspace", "msg": "", "code": "NO_WORKSPACE"}
-        )
+        return JsonResponse({"result": "no_workspace", "msg": "", "code": "NO_WORKSPACE"})
 
     realm = ranked_realms[0]
     logger.info(
@@ -233,7 +234,9 @@ def _auth_bridge_inner(request: HttpRequest) -> JsonResponse:
         is_active=True,
     ).exists()
 
-    logger.info("NODL_DEBUG: user_existed_before=%s, calling get_or_create_zulip_user", user_existed_before)
+    logger.info(
+        "NODL_DEBUG: user_existed_before=%s, calling get_or_create_zulip_user", user_existed_before
+    )
     try:
         user_profile = get_or_create_zulip_user(payload, realm)
     except Exception:
@@ -247,7 +250,9 @@ def _auth_bridge_inner(request: HttpRequest) -> JsonResponse:
             status=500,
         )
 
-    logger.info("NODL_DEBUG: user_profile id=%d email=%s", user_profile.id, user_profile.delivery_email)
+    logger.info(
+        "NODL_DEBUG: user_profile id=%d email=%s", user_profile.id, user_profile.delivery_email
+    )
 
     # Mark any pending invites for this phone as registered
     if phone and not user_existed_before:

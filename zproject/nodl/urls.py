@@ -1,6 +1,7 @@
 from django.urls import path
 
 from zproject.nodl.views.auth_bridge import auth_bridge
+from zproject.nodl.views.auth_bridge_v2 import auth_bridge_v2, auth_workspaces
 from zproject.nodl.views.calls import (
     accept_call,
     call_detail,
@@ -19,6 +20,8 @@ from zproject.nodl.views.webhooks_livekit import livekit_webhook
 
 urlpatterns = [
     path("auth/bridge", auth_bridge, name="nodl_auth_bridge"),
+    path("auth/bridge/v2", auth_bridge_v2, name="nodl_auth_bridge_v2"),
+    path("auth/workspaces", auth_workspaces, name="nodl_auth_workspaces"),
     path("pin/set", pin_set, name="nodl_pin_set"),
     path("pin/verify", pin_verify, name="nodl_pin_verify"),
     path("contacts/match", contacts_match, name="nodl_contacts_match"),
