@@ -618,6 +618,47 @@ class CallViewsTest(ZulipTestCase):
         self.assertEqual(result.status_code, 400)
         self.assertIn("Cannot call yourself", result.json()["msg"])
 
+    @patch.dict("os.environ", MOCK_LIVEKIT_ENV)
+    @patch("zproject.nodl.services.livekit_service.LIVEKIT_URL", MOCK_LIVEKIT_ENV["LIVEKIT_URL"])
+    @patch(
+        "zproject.nodl.services.livekit_service.LIVEKIT_API_KEY",
+        MOCK_LIVEKIT_ENV["LIVEKIT_API_KEY"],
+    )
+    @patch(
+        "zproject.nodl.services.livekit_service.LIVEKIT_API_SECRET",
+        MOCK_LIVEKIT_ENV["LIVEKIT_API_SECRET"],
+    )
+    def test_initiate_cross_realm_callee_rejected(self) -> None:
+        """A callee in another realm is invisible — 400, no call record."""
+        from zerver.actions.create_realm import do_create_realm
+        from zerver.actions.create_user import do_create_user
+        from zerver.models import Realm
+
+        other_realm = do_create_realm(
+            string_id="other-realm-calls",
+            name="Other Realm",
+            description="",
+            org_type=Realm.ORG_TYPES["business"]["id"],
+            create_zulip_discussion_channel=False,
+        )
+        stranger = do_create_user(
+            email="stranger@example.com",
+            password=None,
+            realm=other_realm,
+            full_name="Stranger",
+            acting_user=None,
+        )
+
+        result = self.client_post(
+            "/nodl/calls/initiate",
+            json.dumps({"callee_id": stranger.id}),
+            content_type="application/json",
+            **self._auth_headers(self.caller),
+        )
+        self.assertEqual(result.status_code, 400)
+        self.assertIn("Callee not found", result.json()["msg"])
+        self.assertFalse(CallRecord.objects.filter(callee=stranger).exists())
+
     def test_call_not_found(self) -> None:
         fake_id = str(uuid.uuid4())
         result = self.client_post(

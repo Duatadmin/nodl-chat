@@ -4,15 +4,29 @@ import threading
 import uuid
 from unittest.mock import MagicMock, patch
 
+from django.conf import settings
 from django.test import TestCase, override_settings
 
+from nodl.extensions.mapping import record_realm_user_mapping, resolve_human_profile_ids
+from nodl.extensions.models import NodlRealmExtension, SyncStatus
+from zerver.actions.create_realm import do_create_realm
+from zerver.actions.create_user import do_create_user
 from zerver.lib.test_classes import ZulipTestCase
-from zerver.models import UserProfile
+from zerver.models import Realm, UserProfile
 from zproject.nodl.models import CallRecord, DeviceVoipToken
 from zproject.nodl.services.call_push_service import (
     dispatch_call_push,
     dispatch_call_push_async,
 )
+
+
+def default_recipient_kwargs(callee_id: int, workspace_id: str = "") -> dict[str, str]:
+    """The recipient-identity kwargs dispatch passes to every send call."""
+    return {
+        "recipient_user_id": str(callee_id),
+        "recipient_realm_url": settings.ROOT_DOMAIN_URI,
+        "recipient_workspace_id": workspace_id,
+    }
 
 
 # ===== VoIP Token Endpoint Tests =====
@@ -268,7 +282,8 @@ class DispatchCallPushTest(TestCase):
         )
 
         mock_ios.assert_called_once_with(
-            "apns-token", self.call_id, self.room_name, "Caller", "https://avatar.url"
+            "apns-token", self.call_id, self.room_name, "Caller", "https://avatar.url",
+            **default_recipient_kwargs(self.callee.id),
         )
         mock_fcm.assert_not_called()
 
@@ -288,7 +303,8 @@ class DispatchCallPushTest(TestCase):
         )
 
         mock_fcm.assert_called_once_with(
-            "fcm-token", self.call_id, self.room_name, "Caller", ""
+            "fcm-token", self.call_id, self.room_name, "Caller", "",
+            **default_recipient_kwargs(self.callee.id),
         )
         mock_ios.assert_not_called()
 
@@ -385,6 +401,237 @@ class DispatchCallPushTest(TestCase):
         mock_fcm.assert_not_called()
 
 
+class DispatchCallPushFanOutTest(ZulipTestCase):
+    """Cross-workspace fan-out: one human, N sibling profiles, dedup by token.
+
+    A device may register its push token under any of the human's per-realm
+    profiles; dispatch must find it regardless of which profile is being
+    called, and one physical device must ring exactly once.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.supabase_id = uuid.uuid4()
+        self.realm_a, self.ws_a = self._make_workspace_realm("Workspace A")
+        self.realm_b, self.ws_b = self._make_workspace_realm("Workspace B")
+        self.profile_a = self._make_mapped_profile(
+            self.realm_a, "human-a@example.com", self.supabase_id
+        )
+        self.profile_b = self._make_mapped_profile(
+            self.realm_b, "human-b@example.com", self.supabase_id
+        )
+        self.call_id = str(uuid.uuid4())
+        self.room_name = f"call-{uuid.uuid4()}"
+
+    def _make_workspace_realm(self, name: str) -> tuple[Realm, uuid.UUID]:
+        ws_uuid = uuid.uuid4()
+        realm = do_create_realm(
+            string_id=str(ws_uuid)[:20].lower(),
+            name=name,
+            description="",
+            org_type=Realm.ORG_TYPES["business"]["id"],
+            create_zulip_discussion_channel=False,
+        )
+        NodlRealmExtension.objects.create(
+            zulip_realm=realm,
+            nodl_workspace_id=ws_uuid,
+            sync_status=SyncStatus.SYNCED,
+        )
+        return realm, ws_uuid
+
+    def _make_mapped_profile(
+        self, realm: Realm, email: str, supabase_id: uuid.UUID
+    ) -> UserProfile:
+        profile = do_create_user(
+            email=email,
+            password=None,
+            realm=realm,
+            full_name="Fan-out Test Human",
+            acting_user=None,
+        )
+        assert record_realm_user_mapping(realm, profile, supabase_id) is not None
+        return profile
+
+    def test_resolve_human_profile_ids(self) -> None:
+        ids = resolve_human_profile_ids(self.profile_a.id)
+        self.assertEqual(sorted(ids), sorted([self.profile_a.id, self.profile_b.id]))
+
+    def test_resolve_without_mapping_returns_self(self) -> None:
+        unmapped = self.example_user("hamlet")
+        self.assertEqual(resolve_human_profile_ids(unmapped.id), [unmapped.id])
+
+    @patch("zproject.nodl.services.call_push_service.send_voip_push_ios")
+    @patch("zproject.nodl.services.call_push_service.send_fcm_call_data")
+    def test_token_under_sibling_profile_is_found(
+        self, mock_fcm: MagicMock, mock_ios: MagicMock
+    ) -> None:
+        """Device registered under profile B still rings when profile A is called."""
+        DeviceVoipToken.objects.create(
+            user=self.profile_b,
+            platform="ios",
+            device_id="iphone-001",
+            voip_token="apns-token-b",
+        )
+
+        dispatch_call_push(
+            self.profile_a.id, self.call_id, self.room_name, "Caller", ""
+        )
+
+        mock_ios.assert_called_once_with(
+            "apns-token-b", self.call_id, self.room_name, "Caller", "",
+            **default_recipient_kwargs(self.profile_a.id, str(self.ws_a)),
+        )
+
+    @patch("zproject.nodl.services.call_push_service.send_voip_push_ios")
+    @patch("zproject.nodl.services.call_push_service.send_fcm_call_data")
+    def test_same_token_under_both_profiles_rings_once(
+        self, mock_fcm: MagicMock, mock_ios: MagicMock
+    ) -> None:
+        """One device registered under both sibling profiles → exactly one push."""
+        for profile in (self.profile_a, self.profile_b):
+            DeviceVoipToken.objects.create(
+                user=profile,
+                platform="ios",
+                device_id="iphone-001",
+                voip_token="apns-token-shared",
+            )
+
+        dispatch_call_push(
+            self.profile_a.id, self.call_id, self.room_name, "Caller", ""
+        )
+
+        self.assertEqual(mock_ios.call_count, 1)
+
+    @patch("zproject.nodl.services.call_push_service.send_voip_push_ios")
+    @patch("zproject.nodl.services.call_push_service.send_fcm_call_data")
+    def test_two_devices_across_profiles_ring_both(
+        self, mock_fcm: MagicMock, mock_ios: MagicMock
+    ) -> None:
+        DeviceVoipToken.objects.create(
+            user=self.profile_a,
+            platform="ios",
+            device_id="iphone-001",
+            voip_token="apns-token-1",
+        )
+        DeviceVoipToken.objects.create(
+            user=self.profile_b,
+            platform="android",
+            device_id="pixel-001",
+            fcm_token="fcm-token-2",
+        )
+        mock_fcm.return_value = "sent"
+
+        dispatch_call_push(
+            self.profile_a.id, self.call_id, self.room_name, "Caller", ""
+        )
+
+        self.assertEqual(mock_ios.call_count, 1)
+        self.assertEqual(mock_fcm.call_count, 1)
+
+    @patch("zproject.nodl.services.call_push_service.send_voip_push_ios")
+    @patch("zproject.nodl.services.call_push_service.send_fcm_call_data")
+    def test_rotated_token_rows_both_tried(
+        self, mock_fcm: MagicMock, mock_ios: MagicMock
+    ) -> None:
+        """Same device_id, different token under each profile → both are tried."""
+        DeviceVoipToken.objects.create(
+            user=self.profile_a,
+            platform="android",
+            device_id="pixel-001",
+            fcm_token="fcm-token-old",
+        )
+        DeviceVoipToken.objects.create(
+            user=self.profile_b,
+            platform="android",
+            device_id="pixel-001",
+            fcm_token="fcm-token-new",
+        )
+        mock_fcm.return_value = "sent"
+
+        dispatch_call_push(
+            self.profile_a.id, self.call_id, self.room_name, "Caller", ""
+        )
+
+        self.assertEqual(mock_fcm.call_count, 2)
+
+    @patch("zproject.nodl.services.call_push_service.send_voip_push_ios")
+    @patch("zproject.nodl.services.call_push_service.send_fcm_call_data")
+    def test_unregistered_token_deactivated_across_profiles(
+        self, mock_fcm: MagicMock, mock_ios: MagicMock
+    ) -> None:
+        """A stale FCM token is deactivated on every sibling row carrying it."""
+        for profile in (self.profile_a, self.profile_b):
+            DeviceVoipToken.objects.create(
+                user=profile,
+                platform="android",
+                device_id="pixel-001",
+                fcm_token="fcm-token-stale",
+            )
+        mock_fcm.return_value = "unregistered"
+
+        dispatch_call_push(
+            self.profile_a.id, self.call_id, self.room_name, "Caller", ""
+        )
+
+        self.assertEqual(
+            DeviceVoipToken.objects.filter(
+                fcm_token="fcm-token-stale", is_active=True
+            ).count(),
+            0,
+        )
+
+    @patch("zproject.nodl.services.call_push_service.send_voip_push_ios")
+    @patch("zproject.nodl.services.call_push_service.send_fcm_call_data")
+    def test_push_device_token_fallback_spans_profiles(
+        self, mock_fcm: MagicMock, mock_ios: MagicMock
+    ) -> None:
+        """PushDeviceToken fallback considers sibling profiles too."""
+        from zerver.models import PushDeviceToken
+
+        PushDeviceToken.objects.create(
+            user=self.profile_b,
+            kind=PushDeviceToken.FCM,
+            token="zulip-fcm-token-b",
+        )
+        mock_fcm.return_value = "sent"
+
+        dispatch_call_push(
+            self.profile_a.id, self.call_id, self.room_name, "Caller", ""
+        )
+
+        mock_fcm.assert_called_once_with(
+            "zulip-fcm-token-b", self.call_id, self.room_name, "Caller", "",
+            **default_recipient_kwargs(self.profile_a.id, str(self.ws_a)),
+        )
+
+    @patch("zproject.nodl.services.call_push_service.send_voip_push_ios")
+    @patch("zproject.nodl.services.call_push_service.send_fcm_call_data")
+    def test_fallback_skips_token_already_tried(
+        self, mock_fcm: MagicMock, mock_ios: MagicMock
+    ) -> None:
+        """A token that failed via DeviceVoipToken is not retried via fallback."""
+        from zerver.models import PushDeviceToken
+
+        DeviceVoipToken.objects.create(
+            user=self.profile_a,
+            platform="android",
+            device_id="pixel-001",
+            fcm_token="fcm-token-dup",
+        )
+        PushDeviceToken.objects.create(
+            user=self.profile_a,
+            kind=PushDeviceToken.FCM,
+            token="fcm-token-dup",
+        )
+        mock_fcm.return_value = "error"
+
+        dispatch_call_push(
+            self.profile_a.id, self.call_id, self.room_name, "Caller", ""
+        )
+
+        self.assertEqual(mock_fcm.call_count, 1)
+
+
 class DispatchCallPushAsyncTest(TestCase):
     """Tests for fire-and-forget async dispatch."""
 
@@ -460,6 +707,38 @@ class SendFcmCallDataTest(TestCase):
         self.assertEqual(msg_data["room_name"], "call-room")
         self.assertEqual(msg_data["caller_name"], "Hamlet")
         self.assertEqual(msg_data["caller_avatar_url"], "https://avatar")
+        # Recipient identity keys are always present (empty without kwargs)
+        self.assertEqual(msg_data["recipient_user_id"], "")
+        self.assertEqual(msg_data["recipient_realm_url"], "")
+        self.assertEqual(msg_data["recipient_workspace_id"], "")
+
+    @patch(
+        "zproject.nodl.services.call_push_service._ensure_firebase_initialized",
+        return_value=True,
+    )
+    @patch("zproject.nodl.services.call_push_service.messaging")
+    def test_fcm_send_includes_recipient_identity(
+        self, mock_messaging: MagicMock, mock_init: MagicMock
+    ) -> None:
+        """Recipient identity kwargs land in the FCM data payload."""
+        from zproject.nodl.services.call_push_service import send_fcm_call_data
+
+        mock_messaging.send.return_value = "projects/test/messages/123"
+
+        send_fcm_call_data(
+            "fcm-token-123", "call-id-abc", "call-room", "Hamlet", "",
+            recipient_user_id="57",
+            recipient_realm_url="https://chat.example.com",
+            recipient_workspace_id="80e9f594-0000-0000-0000-000000000000",
+        )
+
+        call_kwargs = mock_messaging.Message.call_args
+        msg_data = call_kwargs.kwargs.get("data") or call_kwargs[1].get("data")
+        self.assertEqual(msg_data["recipient_user_id"], "57")
+        self.assertEqual(msg_data["recipient_realm_url"], "https://chat.example.com")
+        self.assertEqual(
+            msg_data["recipient_workspace_id"], "80e9f594-0000-0000-0000-000000000000"
+        )
 
     @patch("zproject.nodl.services.call_push_service._ensure_firebase_initialized", return_value=True)
     @patch("zproject.nodl.services.call_push_service.messaging")

@@ -127,9 +127,12 @@ def initiate_call(request: HttpRequest, user_profile: UserProfile) -> HttpRespon
             status=400,
         )
 
-    # Validate callee exists
+    # Validate callee exists — in the caller's own realm. Without the realm
+    # scope any authenticated user could ring any user id on the server.
     try:
-        callee = UserProfile.objects.get(id=callee_id, is_active=True)
+        callee = UserProfile.objects.get(
+            id=callee_id, is_active=True, realm_id=user_profile.realm_id,
+        )
     except UserProfile.DoesNotExist:
         return JsonResponse(
             {"result": "error", "msg": "Callee not found", "code": "BAD_REQUEST"},

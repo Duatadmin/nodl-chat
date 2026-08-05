@@ -112,6 +112,10 @@ def send_voip_push_ios(
     room_name: str,
     caller_name: str,
     caller_avatar_url: str,
+    *,
+    recipient_user_id: str = "",
+    recipient_realm_url: str = "",
+    recipient_workspace_id: str = "",
 ) -> bool:
     """Send an APNs VoIP push notification to an iOS device.
 
@@ -144,6 +148,11 @@ def send_voip_push_ios(
             "room_name": room_name,
             "caller_name": caller_name,
             "caller_avatar_url": caller_avatar_url,
+            # Which local account should take this call — the token may have
+            # been registered under a sibling profile of the same human.
+            "recipient_user_id": recipient_user_id,
+            "recipient_realm_url": recipient_realm_url,
+            "recipient_workspace_id": recipient_workspace_id,
         }
 
         request = NotificationRequest(
@@ -175,6 +184,10 @@ def send_fcm_call_data(
     room_name: str,
     caller_name: str,
     caller_avatar_url: str,
+    *,
+    recipient_user_id: str = "",
+    recipient_realm_url: str = "",
+    recipient_workspace_id: str = "",
 ) -> str:
     """Send an FCM high-priority DATA message to an Android device.
 
@@ -199,6 +212,9 @@ def send_fcm_call_data(
                 "room_name": room_name,
                 "caller_name": caller_name,
                 "caller_avatar_url": caller_avatar_url,
+                "recipient_user_id": recipient_user_id,
+                "recipient_realm_url": recipient_realm_url,
+                "recipient_workspace_id": recipient_workspace_id,
             },
             token=fcm_token,
             android=messaging.AndroidConfig(
@@ -227,7 +243,15 @@ def dispatch_call_push(
     caller_name: str,
     caller_avatar_url: str,
 ) -> None:
-    """Dispatch incoming call push notifications to ALL active devices of the callee.
+    """Dispatch incoming call push notifications to ALL devices of the callee HUMAN.
+
+    One human holds one Zulip profile per workspace realm, and a device may
+    have registered its push tokens under any of those sibling profiles —
+    so token lookup fans out over resolve_human_profile_ids(callee_id) and
+    dedupes by token value so each physical device rings exactly once.
+    The payload carries the callee profile's identity (recipient_user_id /
+    realm URL / workspace id) so the app knows which local account must
+    accept the call.
 
     Queries DeviceVoipToken for active tokens, sends platform-appropriate
     push to each. For Android, if all DeviceVoipToken FCM sends fail,
@@ -241,22 +265,58 @@ def dispatch_call_push(
     fire-and-forget thread.
     """
     # Import here to avoid circular imports at module level
-    from zerver.models import PushDeviceToken
+    from django.conf import settings
+
+    from nodl.extensions.mapping import resolve_human_profile_ids
+    from nodl.extensions.models import NodlRealmExtension
+    from zerver.models import PushDeviceToken, UserProfile
     from zproject.nodl.models import DeviceVoipToken
 
     try:
+        # Recipient identity for the payload: the app's accounts all live on
+        # the bare root host (per-realm subdomain URLs are never used by
+        # mobile), and Zulip user ids are server-global — so ROOT_DOMAIN_URI
+        # plus the callee profile id identifies the target account.
+        recipient_workspace_id = ""
+        callee_realm_id = (
+            UserProfile.objects.filter(id=callee_id)
+            .values_list("realm_id", flat=True)
+            .first()
+        )
+        if callee_realm_id is not None:
+            realm_ext = (
+                NodlRealmExtension.objects.filter(zulip_realm_id=callee_realm_id)
+                .only("nodl_workspace_id")
+                .first()
+            )
+            if realm_ext is not None:
+                recipient_workspace_id = str(realm_ext.nodl_workspace_id)
+
+        recipient = {
+            "recipient_user_id": str(callee_id),
+            "recipient_realm_url": settings.ROOT_DOMAIN_URI,
+            "recipient_workspace_id": recipient_workspace_id,
+        }
+
+        profile_ids = resolve_human_profile_ids(callee_id)
+
         tokens = list(
             DeviceVoipToken.objects.filter(
-                user_id=callee_id,
+                user_id__in=profile_ids,
                 is_active=True,
             ).values("platform", "voip_token", "fcm_token", "device_id")
         )
 
         if not tokens:
-            logger.info("No active device tokens for callee %s — push skipped", callee_id)
+            logger.info(
+                "No active device tokens for callee %s (%d sibling profiles) — push skipped",
+                callee_id, len(profile_ids),
+            )
             # Even with no DeviceVoipToken, try the PushDeviceToken fallback below.
 
         any_android_success = False
+        tried_voip_tokens: set[str] = set()
+        tried_fcm_tokens: set[str] = set()
 
         for token_record in tokens:
             platform = token_record["platform"]
@@ -267,22 +327,33 @@ def dispatch_call_push(
                 if not voip_token:
                     logger.warning("iOS device %s has no voip_token — skipping", device_id)
                     continue
-                send_voip_push_ios(voip_token, call_id, room_name, caller_name, caller_avatar_url)
+                if voip_token in tried_voip_tokens:
+                    continue  # same device registered under a sibling profile
+                tried_voip_tokens.add(voip_token)
+                send_voip_push_ios(
+                    voip_token, call_id, room_name, caller_name, caller_avatar_url,
+                    **recipient,
+                )
 
             elif platform == "android":
                 fcm_token = token_record.get("fcm_token")
                 if not fcm_token:
                     logger.warning("Android device %s has no fcm_token — skipping", device_id)
                     continue
+                if fcm_token in tried_fcm_tokens:
+                    continue  # same device registered under a sibling profile
+                tried_fcm_tokens.add(fcm_token)
                 result = send_fcm_call_data(
                     fcm_token, call_id, room_name, caller_name, caller_avatar_url,
+                    **recipient,
                 )
                 if result == "sent":
                     any_android_success = True
                 elif result == "unregistered":
-                    # Firebase best practice: deactivate stale token immediately.
+                    # Firebase best practice: deactivate stale token immediately —
+                    # every row carrying it, whichever sibling profile owns it.
                     DeviceVoipToken.objects.filter(
-                        user_id=callee_id, device_id=device_id,
+                        user_id__in=profile_ids, fcm_token=fcm_token,
                     ).update(is_active=False)
                     logger.info("Deactivated stale DeviceVoipToken for device %s", device_id)
 
@@ -296,7 +367,7 @@ def dispatch_call_push(
         if not any_android_success:
             zulip_fcm_tokens = list(
                 PushDeviceToken.objects.filter(
-                    user_id=callee_id,
+                    user_id__in=profile_ids,
                     kind=PushDeviceToken.FCM,
                 ).values_list("token", flat=True)
             )
@@ -307,8 +378,12 @@ def dispatch_call_push(
                     callee_id, len(zulip_fcm_tokens),
                 )
             for fallback_token in zulip_fcm_tokens:
+                if fallback_token in tried_fcm_tokens:
+                    continue  # already tried (and failed) via DeviceVoipToken
+                tried_fcm_tokens.add(fallback_token)
                 result = send_fcm_call_data(
                     fallback_token, call_id, room_name, caller_name, caller_avatar_url,
+                    **recipient,
                 )
                 if result == "sent":
                     logger.info("FCM sent via PushDeviceToken fallback for user %s", callee_id)

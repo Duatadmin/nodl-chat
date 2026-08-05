@@ -89,3 +89,33 @@ def record_realm_user_mapping(
             supabase_uuid,
         )
         return None
+
+
+def resolve_human_profile_ids(profile_id: int) -> list[int]:
+    """All Zulip profile ids that realize the same human as *profile_id*.
+
+    One human has one Zulip profile per workspace realm; this walks
+    profile -> supabase user -> sibling profiles.  A device may have
+    registered its push tokens under any of those profiles, so push
+    dispatch fans out over the full set.
+
+    When *profile_id* has no mapping (legacy user, bot, unmapped profile)
+    the result is just ``[profile_id]`` — dispatch degrades to today's
+    single-profile behavior.
+    """
+    mapping = (
+        NodlRealmUserExtension.objects.filter(zulip_user_id=profile_id)
+        .only("supabase_user_id")
+        .first()
+    )
+    if mapping is None:
+        return [profile_id]
+
+    ids = list(
+        NodlRealmUserExtension.objects.filter(
+            supabase_user_id=mapping.supabase_user_id
+        ).values_list("zulip_user_id", flat=True)
+    )
+    if profile_id not in ids:
+        ids.append(profile_id)
+    return ids
