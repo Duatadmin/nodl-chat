@@ -43,10 +43,9 @@ class Command(BaseCommand):
         commit: bool = options["commit"]
         realm_filter: str | None = options.get("realm")
 
-        extensions = (
-            NodlTaskStreamExtension.objects.select_related("zulip_stream", "zulip_realm")
-            .order_by("zulip_realm_id", "zulip_stream_id")
-        )
+        extensions = NodlTaskStreamExtension.objects.select_related(
+            "zulip_stream", "zulip_realm"
+        ).order_by("zulip_realm_id", "zulip_stream_id")
         if realm_filter:
             extensions = extensions.filter(zulip_realm__string_id=realm_filter)
 

@@ -30,7 +30,7 @@ from zerver.actions.message_edit import do_update_message
 from zerver.actions.message_flags import do_update_message_flags
 from zerver.actions.message_send import check_send_message
 from zerver.actions.muted_users import do_mute_user, do_unmute_user
-from zerver.lib.exceptions import JsonableError
+from zerver.lib.exceptions import JsonableError, RateLimitedError
 from zerver.lib.markdown import render_message_markdown
 from zerver.lib.mention import MentionBackend, MentionData
 from zerver.lib.message import access_message, get_recent_private_conversations, messages_for_ids
@@ -39,7 +39,7 @@ from zerver.lib.rate_limiter import RateLimitedObject, RedisRateLimiterBackend
 from zerver.lib.streams import access_stream_by_id
 from zerver.lib.types import StreamMessageEditRequest
 from zerver.lib.users import access_user_by_id_including_cross_realm
-from zerver.models import Message, Reaction, Subscription, UserMessage, UserProfile
+from zerver.models import Message, MutedUser, Reaction, Subscription, UserMessage, UserProfile
 from zerver.models.clients import get_client
 from zerver.models.streams import get_stream_by_id_in_realm
 
@@ -108,16 +108,23 @@ def rate_limit(key_prefix: str, limit: int, window: int = RATE_LIMIT_WINDOW) -> 
             rate_limiter = MessagesRateLimitedObject(user.id, key_prefix, limit, window)
             try:
                 rate_limiter.rate_limit_request(request)
-            except Exception:
+            except RateLimitedError as e:
                 return JsonResponse(
                     {
                         "result": "error",
                         "code": "RATE_LIMITED",
                         "msg": "Too many requests. Please wait before sending more messages.",
-                        "retry_after": window,
+                        "retry_after": int(e.secs_to_freedom) if e.secs_to_freedom else window,
                     },
                     status=429,
                 )
+            except Exception:
+                # Fail open on limiter-infrastructure failures (e.g. Redis
+                # unreachable): a backend blip must not turn every request —
+                # including the mobile inbox poll — into a 429. Tradeoff:
+                # throttling (reads and writes alike) is disabled while the
+                # limiter backend is down.
+                logger.exception("Rate limiter backend failure; failing open")
 
             return view_func(request, *args, **kwargs)
 
@@ -1082,6 +1089,35 @@ def delete_message(request: HttpRequest, message_id: int) -> HttpResponse:
         )
 
 
+DM_PREVIEW_MAX_CHARS = 100
+
+
+def _dm_preview_text(message: Message) -> str:
+    """Plain-text preview of a message, matching how clients render it.
+
+    Uses Zulip's push-notification HTML->text converter on rendered_content
+    (handles emoji spans, image alt text, blockquotes, KaTeX, spoilers), so
+    the polled preview agrees with a client that strips the rendered HTML —
+    instead of leaking raw Markdown source. Whitespace is collapsed and the
+    result is truncated with an ellipsis.
+    """
+    # Local import: don't pay the push-notifications import at module load.
+    from zerver.lib.push_notifications import get_mobile_push_content
+
+    text = message.content
+    if message.rendered_content:
+        try:
+            text = get_mobile_push_content(message.rendered_content)
+        except Exception:
+            # An lxml parse failure must not 500 the inbox; raw content is
+            # an acceptable degraded preview.
+            logger.exception("Failed to render DM preview for message %d", message.id)
+    text = " ".join(text.split())
+    if len(text) > DM_PREVIEW_MAX_CHARS:
+        text = text[:DM_PREVIEW_MAX_CHARS] + "…"
+    return text
+
+
 @require_jwt_auth
 @rate_limit(key_prefix="messages_read", limit=MESSAGES_READ_LIMIT)
 def list_dm_conversations(request: HttpRequest) -> HttpResponse:
@@ -1091,6 +1127,20 @@ def list_dm_conversations(request: HttpRequest) -> HttpResponse:
 
     Uses Zulip's get_recent_private_conversations() which correctly queries
     UserMessage with is_private flag instead of Subscription table.
+
+    Structural limit: enumeration covers the user's most recent 1000 DM
+    UserMessage rows (RECENT_CONVERSATIONS_LIMIT); a conversation whose
+    entire history falls outside that window is absent from the response,
+    including its unread count.
+
+    Invariants:
+    - `user_ids` = ALL counterparts (including bots); `users[]` = human
+      participants only, active or not (deactivated entries carry
+      `is_active: false`). Clients key conversations by `user_ids` and
+      render from `users[]`.
+    - `unread_count` counts only messages with id <= `last_message_id`, so
+      the count and the preview always describe the same snapshot.
+    - Rows are sorted by `last_message_id` descending.
 
     Response:
     {
@@ -1105,15 +1155,20 @@ def list_dm_conversations(request: HttpRequest) -> HttpResponse:
                         "email": "alice@example.com",
                         "avatar_url": "/avatar/9",
                         "nodl_user_id": "<supabase uuid or null>",
+                        "is_active": true,
                     }
                 ],
                 "last_message": {
                     "id": 12345,
-                    "content": "Hello!",
+                    "content": "Hello!",          # plain text, <=100 chars + ellipsis
+                    "preview_message_id": 12345,  # the message `content` belongs to
                     "sender_id": 9,
+                    "sender_full_name": "Alice",
                     "timestamp": 1234567890
                 },
-                "unread_count": 2
+                "last_message_id": 12345,
+                "unread_count": 2,
+                "muted": false
             }
         ]
     }
@@ -1136,13 +1191,18 @@ def list_dm_conversations(request: HttpRequest) -> HttpResponse:
         all_participant_ids = {
             user_id for data in recipient_map.values() for user_id in data["user_ids"]
         }
+        # Deactivated humans are INCLUDED (flagged is_active below): dropping
+        # them would make their conversations vanish while the unread messages
+        # persist — an orphaned count the client can never reconcile.
         profiles_by_id = {
             u["id"]: u
             for u in UserProfile.objects.filter(
                 id__in=all_participant_ids,
-                is_active=True,
-            ).values("id", "full_name", "delivery_email", "avatar_source", "is_bot")
+            ).values("id", "full_name", "delivery_email", "avatar_source", "is_bot", "is_active")
         }
+        muted_user_ids = set(
+            MutedUser.objects.filter(user_profile=user).values_list("muted_user_id", flat=True)
+        )
         # Cross-realm human identity: the mobile unified inbox groups
         # counterparts by supabase id (email alone is not a reliable join key).
         supabase_id_by_user_id = {
@@ -1163,17 +1223,25 @@ def list_dm_conversations(request: HttpRequest) -> HttpResponse:
         # recipient) count under the sender's personal recipient id; everything
         # else (group DMs, modern direct-message-group model) under the
         # message's own recipient id.
-        unread_by_recipient: dict[int, int] = defaultdict(int)
+        # Message ids are kept so each conversation's count can be clamped to
+        # its enumeration-time max_message_id: the enumeration, the message
+        # fetch, and this query are separate READ COMMITTED statements, so a
+        # message arriving mid-request would otherwise increment the count
+        # while the preview still shows the older message. Clamping makes
+        # count and preview describe the same snapshot by construction; the
+        # next poll picks up the newer message. (transaction.atomic would NOT
+        # fix this — each statement still gets a fresh snapshot.)
+        unread_ids_by_recipient: dict[int, list[int]] = defaultdict(list)
         unread_rows = UserMessage.objects.filter(
             user_profile=user,
             flags__andnz=UserMessage.flags.is_private.mask,
             flags__andz=UserMessage.flags.read.mask,
-        ).values_list("message__recipient_id", "message__sender__recipient_id")
-        for message_recipient_id, sender_recipient_id in unread_rows:
+        ).values_list("message_id", "message__recipient_id", "message__sender__recipient_id")
+        for message_id, message_recipient_id, sender_recipient_id in unread_rows:
             if user.recipient_id is not None and message_recipient_id == user.recipient_id:
-                unread_by_recipient[sender_recipient_id] += 1
+                unread_ids_by_recipient[sender_recipient_id].append(message_id)
             else:
-                unread_by_recipient[message_recipient_id] += 1
+                unread_ids_by_recipient[message_recipient_id].append(message_id)
 
         conversations = []
 
@@ -1200,35 +1268,50 @@ def list_dm_conversations(request: HttpRequest) -> HttpResponse:
                     "email": u["delivery_email"],
                     "avatar_url": f"/avatar/{u['id']}" if u.get("avatar_source") else None,
                     "nodl_user_id": supabase_id_by_user_id.get(u["id"]),
+                    "is_active": u["is_active"],
                 }
                 for u in non_bot_users
             ]
 
             last_message = last_messages_by_id.get(data["max_message_id"])
-            last_message_data = None
-            if last_message:
-                last_message_data = {
-                    "id": last_message.id,
-                    "content": last_message.content[:100],  # Preview only
-                    "sender_id": last_message.sender_id,
-                    "sender_full_name": last_message.sender.full_name,
-                    "timestamp": int(last_message.date_sent.timestamp()),
-                }
+            if last_message is None:
+                # The newest message was deleted between enumeration and the
+                # message fetch. Drop the row for this response — the next
+                # poll's enumeration re-derives the next-newest message.
+                # (Emitting it would sort a blank-preview row to the bottom.)
+                continue
 
+            last_message_data = {
+                "id": last_message.id,
+                "content": _dm_preview_text(last_message),
+                "preview_message_id": last_message.id,
+                "sender_id": last_message.sender_id,
+                "sender_full_name": last_message.sender.full_name,
+                "timestamp": int(last_message.date_sent.timestamp()),
+            }
+
+            max_message_id = data["max_message_id"]
             conversations.append(
                 {
                     "user_ids": participant_ids,
                     "users": users_data,
                     "last_message": last_message_data,
-                    "unread_count": unread_by_recipient.get(recipient_id, 0),
+                    "last_message_id": max_message_id,
+                    "unread_count": sum(
+                        1
+                        for mid in unread_ids_by_recipient.get(recipient_id, ())
+                        if mid <= max_message_id
+                    ),
+                    # A 1:1 with a muted counterpart — or a group where every
+                    # human counterpart is muted — is flagged, never hidden
+                    # (hiding would orphan its unread count client-side).
+                    "muted": all(u["id"] in muted_user_ids for u in non_bot_users),
                 }
             )
 
-        # Sort by last message timestamp (most recent first)
-        conversations.sort(
-            key=lambda c: c["last_message"]["timestamp"] if c["last_message"] else 0,
-            reverse=True,
-        )
+        # Most recent first. Message ids are monotonic on this server, so the
+        # sort is stable and tie-free (second-granularity timestamps are not).
+        conversations.sort(key=lambda c: c["last_message_id"], reverse=True)
 
         return JsonResponse(
             {
@@ -1237,10 +1320,10 @@ def list_dm_conversations(request: HttpRequest) -> HttpResponse:
             }
         )
 
-    except Exception as e:
+    except Exception:
         logger.exception("Failed to list DM conversations")
         return JsonResponse(
-            {"result": "error", "code": "FETCH_FAILED", "msg": str(e)},
+            {"result": "error", "code": "FETCH_FAILED", "msg": "Failed to list conversations"},
             status=500,
         )
 
@@ -1333,7 +1416,12 @@ def mark_messages_as_read(request: HttpRequest) -> HttpResponse:
 @require_jwt_auth
 @rate_limit(key_prefix="dm_write", limit=MESSAGES_WRITE_LIMIT)
 def mute_dm_user(request: HttpRequest, user_id: int) -> HttpResponse:
-    """Mute a user (hide their DMs from conversation list).
+    """Mute a user.
+
+    Muted counterparts stay in the conversation list but are flagged
+    `muted: true` there (clients style/deprioritize; hiding rows would
+    orphan their unread counts). New messages from muted users arrive
+    pre-read per Zulip semantics.
 
     POST /api/v1/dm/{user_id}/mute
 

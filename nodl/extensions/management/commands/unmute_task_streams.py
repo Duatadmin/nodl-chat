@@ -86,8 +86,7 @@ class Command(BaseCommand):
                 )
                 unmuted += 1
             self.stdout.write(
-                f"realm {realm.id} stream {stream.id} ({stream.name!r}): "
-                f"unmuted {len(muted_subs)}"
+                f"realm {realm.id} stream {stream.id} ({stream.name!r}): unmuted {len(muted_subs)}"
             )
 
         mode = "would unmute" if not commit else "unmuted"

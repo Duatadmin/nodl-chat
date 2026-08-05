@@ -308,3 +308,186 @@ class ListDmConversationsIdentityTest(TaskChatsFixtureMixin):
         one_on_one = [c for c in conversations if c["user_ids"] == [self.alice.id]]
         self.assert_length(one_on_one, 1)
         self.assertEqual(one_on_one[0]["unread_count"], 0)
+
+    def test_deactivated_counterpart_included_and_flagged(self) -> None:
+        """A 1:1 with a deactivated user keeps its row (and unreads) — dropping
+        it would orphan the unread count client-side."""
+        from zerver.actions.users import do_deactivate_user
+
+        self.send_personal_message(self.alice, self.bob, "before leaving")
+        do_deactivate_user(self.alice, acting_user=None)
+
+        conversations = self._conversations_for(self.bob)
+        one_on_one = [c for c in conversations if c["user_ids"] == [self.alice.id]]
+        self.assert_length(one_on_one, 1)
+        (alice_entry,) = one_on_one[0]["users"]
+        self.assertFalse(alice_entry["is_active"])
+        self.assertEqual(one_on_one[0]["unread_count"], 1)
+
+    def test_active_counterpart_flagged_active(self) -> None:
+        self.send_personal_message(self.alice, self.bob, "hello")
+        conversations = self._conversations_for(self.bob)
+        (alice_entry,) = conversations[0]["users"]
+        self.assertTrue(alice_entry["is_active"])
+
+    def test_bot_only_conversation_excluded(self) -> None:
+        bot = do_create_user(
+            email="helper-bot@example.com",
+            password=None,
+            realm=self.realm,
+            full_name="Helper Bot",
+            bot_type=UserProfile.DEFAULT_BOT,
+            bot_owner=self.bob,
+            acting_user=None,
+        )
+        self.send_personal_message(bot, self.bob, "beep")
+
+        conversations = self._conversations_for(self.bob)
+        self.assertNotIn([bot.id], [c["user_ids"] for c in conversations])
+        # Per-row counts only — no aggregate that could leak the bot's unreads.
+        for c in conversations:
+            self.assertEqual(
+                set(c.keys()),
+                {"user_ids", "users", "last_message", "last_message_id", "unread_count", "muted"},
+            )
+
+    def test_self_dm_excluded(self) -> None:
+        self.send_personal_message(self.bob, self.bob, "note to self")
+        conversations = self._conversations_for(self.bob)
+        self.assertNotIn([], [c["user_ids"] for c in conversations])
+        self.assertNotIn([self.bob.id], [c["user_ids"] for c in conversations])
+
+    def test_ordering_by_last_message_id_desc(self) -> None:
+        """Back-to-back messages share a truncated-seconds timestamp; ordering
+        must come from monotonic message ids, not the timestamp."""
+        self.send_personal_message(self.alice, self.bob, "first conversation")
+        self.send_personal_message(self.carol, self.bob, "second conversation")
+        self.send_group_direct_message(self.alice, [self.bob, self.carol], "third conversation")
+
+        conversations = self._conversations_for(self.bob)
+        ids = [c["last_message_id"] for c in conversations]
+        self.assertEqual(ids, sorted(ids, reverse=True))
+        self.assertEqual(conversations[0]["user_ids"], sorted([self.alice.id, self.carol.id]))
+        for c in conversations:
+            self.assertEqual(c["last_message_id"], c["last_message"]["id"])
+
+    def test_deleted_last_message_drops_row_for_this_response(self) -> None:
+        """If the newest message vanishes between enumeration and fetch, the
+        row is dropped for this response instead of sorting to the bottom with
+        a blank preview."""
+        self.send_personal_message(self.alice, self.bob, "real message")
+        real = self._conversations_for(self.bob)
+        self.assert_length([c for c in real if c["user_ids"] == [self.alice.id]], 1)
+
+        with patch(
+            "nodl.api.views.messages.get_recent_private_conversations",
+            return_value={
+                self.alice.recipient_id: {
+                    "user_ids": [self.alice.id],
+                    "max_message_id": 999_999_999,  # no such message
+                }
+            },
+        ):
+            conversations = self._conversations_for(self.bob)
+        self.assertEqual(conversations, [])
+
+    def test_preview_is_stripped_ellipsized_with_preview_message_id(self) -> None:
+        long_tail = "word " * 40
+        message_id = self.send_personal_message(
+            self.alice, self.bob, f"**bold** [a link](https://example.com/x) {long_tail}"
+        )
+
+        conversations = self._conversations_for(self.bob)
+        one_on_one = [c for c in conversations if c["user_ids"] == [self.alice.id]]
+        self.assert_length(one_on_one, 1)
+        last = one_on_one[0]["last_message"]
+
+        preview = last["content"]
+        self.assertNotIn("<", preview)
+        self.assertNotIn(">", preview)
+        self.assertNotIn("**", preview)  # markdown source not leaked
+        self.assertIn("bold", preview)
+        self.assertIn("a link", preview)
+        self.assertTrue(preview.endswith("…"))
+        self.assertLessEqual(len(preview), 101)
+        self.assertEqual(last["preview_message_id"], message_id)
+        self.assertEqual(last["id"], message_id)
+        self.assertEqual(one_on_one[0]["last_message_id"], message_id)
+
+    def test_muted_flag(self) -> None:
+        from django.utils.timezone import now
+
+        from zerver.actions.muted_users import do_mute_user
+
+        self.send_personal_message(self.alice, self.bob, "from alice")
+        self.send_personal_message(self.carol, self.bob, "from carol")
+        self.send_group_direct_message(self.alice, [self.bob, self.carol], "group")
+        do_mute_user(self.bob, self.alice, now())
+
+        conversations = self._conversations_for(self.bob)
+        by_ids = {tuple(c["user_ids"]): c for c in conversations}
+        self.assertTrue(by_ids[(self.alice.id,)]["muted"])
+        self.assertFalse(by_ids[(self.carol.id,)]["muted"])
+        group_key = tuple(sorted([self.alice.id, self.carol.id]))
+        self.assertFalse(by_ids[group_key]["muted"])  # carol not muted
+
+    def test_rate_limiter_fails_open_on_backend_error(self) -> None:
+        from zerver.lib.exceptions import RateLimitedError
+
+        self.send_personal_message(self.alice, self.bob, "hi")
+        request = RequestFactory().get("/api/v1/dm/conversations")
+        request.user_profile = self.bob
+
+        with patch(
+            "nodl.api.views.messages.MessagesRateLimitedObject.rate_limit_request",
+            side_effect=Exception("redis down"),
+        ):
+            response = list_dm_conversations(request)
+        self.assertEqual(response.status_code, 200)
+
+        with patch(
+            "nodl.api.views.messages.MessagesRateLimitedObject.rate_limit_request",
+            side_effect=RateLimitedError(30),
+        ):
+            response = list_dm_conversations(request)
+        self.assertEqual(response.status_code, 429)
+        self.assertEqual(json.loads(response.content)["retry_after"], 30)
+
+    def test_unread_counts_match_get_raw_unread_data(self) -> None:
+        """Invariant: each returned unread_count equals the pm_dict/huddle_dict
+        grouping from Zulip's own get_raw_unread_data for that conversation."""
+        from zerver.actions.users import do_deactivate_user
+        from zerver.lib.message import get_raw_unread_data
+
+        self.send_personal_message(self.alice, self.bob, "one")
+        self.send_personal_message(self.alice, self.bob, "two")
+        self.send_personal_message(self.carol, self.bob, "three")
+        self.send_group_direct_message(self.alice, [self.bob, self.carol], "group one")
+        self.send_group_direct_message(self.carol, [self.bob, self.alice], "group two")
+        do_deactivate_user(self.carol, acting_user=None)
+
+        raw = get_raw_unread_data(self.bob)
+        expected_one_on_one: dict[int, int] = {}
+        for _mid, info in raw.pm_dict.items():
+            other = info["other_user_id"]
+            expected_one_on_one[other] = expected_one_on_one.get(other, 0) + 1
+        expected_group: dict[frozenset[int], int] = {}
+        for _mid, info in raw.huddle_dict.items():
+            ids = frozenset(int(x) for x in info["user_ids_string"].split(",")) - {self.bob.id}
+            expected_group[ids] = expected_group.get(ids, 0) + 1
+
+        conversations = self._conversations_for(self.bob)
+        for c in conversations:
+            ids = c["user_ids"]
+            if len(ids) == 1:
+                self.assertEqual(
+                    c["unread_count"],
+                    expected_one_on_one.get(ids[0], 0),
+                    f"1:1 with {ids[0]}",
+                )
+            else:
+                self.assertEqual(
+                    c["unread_count"],
+                    expected_group.get(frozenset(ids), 0),
+                    f"group {ids}",
+                )
