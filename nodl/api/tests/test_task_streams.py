@@ -61,7 +61,7 @@ class TestTaskStreamSync(TestCase):
         request.is_service_request = True
         return request
 
-    @patch("nodl.api.views.task_streams._set_task_subscription_preferences")
+    @patch("nodl.api.views.task_streams.get_or_create_task_chats_folder")
     @patch("nodl.api.views.task_streams.bulk_add_subscriptions")
     @patch("nodl.api.views.task_streams._resolve_members")
     @patch("nodl.api.views.task_streams.create_stream_if_needed")
@@ -74,11 +74,13 @@ class TestTaskStreamSync(TestCase):
         mock_create_stream: MagicMock,
         mock_resolve_members: MagicMock,
         mock_subscribe: MagicMock,
-        mock_preferences: MagicMock,
+        mock_get_folder: MagicMock,
     ) -> None:
         realm = MagicMock(id=1)
         stream = MagicMock(id=42, name=self.payload["stream_name"])
+        folder = MagicMock(id=7)
         mock_get_realm.return_value = realm
+        mock_get_folder.return_value = folder
         extension_lookup = mock_extension_objects.select_related.return_value.filter.return_value
         extension_lookup.first.return_value = None
         mock_create_stream.return_value = (stream, True)
@@ -92,13 +94,20 @@ class TestTaskStreamSync(TestCase):
         self.assertEqual(data["zulip_stream_id"], 42)
         mock_create_stream.assert_called_once()
         self.assertTrue(mock_create_stream.call_args.kwargs["invite_only"])
+        # Display metadata: description is the task title, stream is filed
+        # under the realm's "Task chats" folder.
+        self.assertEqual(
+            mock_create_stream.call_args.kwargs["stream_description"],
+            "Install cabinets",
+        )
+        self.assertEqual(mock_create_stream.call_args.kwargs["folder"], folder)
         mock_extension_objects.create.assert_called_once()
         self.assertEqual(
             mock_extension_objects.create.call_args.kwargs["task_title"],
             "Install cabinets",
         )
+        # Subscriptions are no longer force-muted: plain bulk_add only.
         mock_subscribe.assert_called_once()
-        mock_preferences.assert_called_once_with(stream, [user])
 
     @patch("nodl.api.views.task_streams.NodlRealmUserExtension.objects")
     @patch("nodl.api.views.task_streams.NodlUserExtension.objects")

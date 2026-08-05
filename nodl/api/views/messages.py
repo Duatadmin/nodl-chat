@@ -24,7 +24,7 @@ from nodl.api.serializers.messages import (
     MessageUpdatePayload,
     ReactionSerializer,
 )
-from nodl.extensions.models import NodlTaskStreamExtension
+from nodl.extensions.models import NodlRealmUserExtension, NodlTaskStreamExtension
 from zerver.actions.message_delete import do_delete_messages
 from zerver.actions.message_edit import do_update_message
 from zerver.actions.message_flags import do_update_message_flags
@@ -1104,6 +1104,7 @@ def list_dm_conversations(request: HttpRequest) -> HttpResponse:
                         "full_name": "Alice",
                         "email": "alice@example.com",
                         "avatar_url": "/avatar/9",
+                        "nodl_user_id": "<supabase uuid or null>",
                     }
                 ],
                 "last_message": {
@@ -1130,6 +1131,50 @@ def list_dm_conversations(request: HttpRequest) -> HttpResponse:
         # Use Zulip's proven function that queries UserMessage with is_private flag
         recipient_map = get_recent_private_conversations(user)
 
+        # Batch all per-conversation lookups up front; this endpoint is polled
+        # once per workspace on every mobile app-open.
+        all_participant_ids = {
+            user_id for data in recipient_map.values() for user_id in data["user_ids"]
+        }
+        profiles_by_id = {
+            u["id"]: u
+            for u in UserProfile.objects.filter(
+                id__in=all_participant_ids,
+                is_active=True,
+            ).values("id", "full_name", "delivery_email", "avatar_source", "is_bot")
+        }
+        # Cross-realm human identity: the mobile unified inbox groups
+        # counterparts by supabase id (email alone is not a reliable join key).
+        supabase_id_by_user_id = {
+            zulip_user_id: str(supabase_user_id)
+            for zulip_user_id, supabase_user_id in NodlRealmUserExtension.objects.filter(
+                zulip_user_id__in=all_participant_ids
+            ).values_list("zulip_user_id", "supabase_user_id")
+        }
+        last_messages_by_id = {
+            m.id: m
+            for m in Message.objects.select_related("sender").filter(
+                id__in=[data["max_message_id"] for data in recipient_map.values()]
+            )
+        }
+
+        # Unread DM counts, keyed the same way get_recent_private_conversations
+        # keys conversations: incoming 1:1 messages (recipient = my personal
+        # recipient) count under the sender's personal recipient id; everything
+        # else (group DMs, modern direct-message-group model) under the
+        # message's own recipient id.
+        unread_by_recipient: dict[int, int] = defaultdict(int)
+        unread_rows = UserMessage.objects.filter(
+            user_profile=user,
+            flags__andnz=UserMessage.flags.is_private.mask,
+            flags__andz=UserMessage.flags.read.mask,
+        ).values_list("message__recipient_id", "message__sender__recipient_id")
+        for message_recipient_id, sender_recipient_id in unread_rows:
+            if user.recipient_id is not None and message_recipient_id == user.recipient_id:
+                unread_by_recipient[sender_recipient_id] += 1
+            else:
+                unread_by_recipient[message_recipient_id] += 1
+
         conversations = []
 
         for recipient_id, data in recipient_map.items():
@@ -1137,16 +1182,12 @@ def list_dm_conversations(request: HttpRequest) -> HttpResponse:
             if not participant_ids:
                 continue
 
-            # Get participant user info (excluding bots)
-            participant_users = list(
-                UserProfile.objects.filter(
-                    id__in=participant_ids,
-                    is_active=True,
-                ).values("id", "full_name", "delivery_email", "avatar_source", "is_bot")
-            )
-
             # Filter out bot users from participants
-            non_bot_users = [u for u in participant_users if not u.get("is_bot")]
+            non_bot_users = [
+                profiles_by_id[user_id]
+                for user_id in participant_ids
+                if user_id in profiles_by_id and not profiles_by_id[user_id].get("is_bot")
+            ]
 
             # Skip conversations where all participants are bots (e.g., Welcome Bot)
             if not non_bot_users:
@@ -1158,15 +1199,12 @@ def list_dm_conversations(request: HttpRequest) -> HttpResponse:
                     "full_name": u["full_name"],
                     "email": u["delivery_email"],
                     "avatar_url": f"/avatar/{u['id']}" if u.get("avatar_source") else None,
+                    "nodl_user_id": supabase_id_by_user_id.get(u["id"]),
                 }
                 for u in non_bot_users
             ]
 
-            # Get last message using the max_message_id from recipient_map
-            last_message = (
-                Message.objects.select_related("sender").filter(id=data["max_message_id"]).first()
-            )
-
+            last_message = last_messages_by_id.get(data["max_message_id"])
             last_message_data = None
             if last_message:
                 last_message_data = {
@@ -1177,31 +1215,12 @@ def list_dm_conversations(request: HttpRequest) -> HttpResponse:
                     "timestamp": int(last_message.date_sent.timestamp()),
                 }
 
-            # Get unread count - handle both DM models
-            # Legacy PERSONAL: messages TO me have recipient=my.recipient_id
-            # Modern GROUP: all messages share the group recipient_id
-            if user.recipient_id is not None:
-                # Legacy PERSONAL model - filter by MY recipient and sender
-                unread_count = UserMessage.objects.filter(
-                    user_profile=user,
-                    message__recipient_id=user.recipient_id,  # Messages sent TO me
-                    message__sender_id__in=participant_ids,  # From the other user(s)
-                    flags__andz=UserMessage.flags.read.mask,  # Unread
-                ).count()
-            else:
-                # Modern DIRECT_MESSAGE_GROUP model - Stream pattern works
-                unread_count = UserMessage.objects.filter(
-                    user_profile=user,
-                    message__recipient_id=recipient_id,  # Shared group recipient
-                    flags__andz=UserMessage.flags.read.mask,  # Unread
-                ).count()
-
             conversations.append(
                 {
                     "user_ids": participant_ids,
                     "users": users_data,
                     "last_message": last_message_data,
-                    "unread_count": unread_count,
+                    "unread_count": unread_by_recipient.get(recipient_id, 0),
                 }
             )
 

@@ -18,14 +18,20 @@ from nodl.extensions.models import (
     NodlTaskStreamExtension,
     NodlUserExtension,
 )
+from nodl.extensions.task_chats import (
+    get_or_create_task_chats_folder,
+    task_stream_description,
+    update_task_stream_description,
+)
 from zerver.actions.create_user import do_create_user
 from zerver.actions.streams import (
     bulk_add_subscriptions,
     bulk_remove_subscriptions,
+    do_change_stream_folder,
     do_deactivate_stream,
 )
 from zerver.lib.streams import create_stream_if_needed
-from zerver.models import Realm, Stream, Subscription, UserProfile
+from zerver.models import Realm, UserProfile
 
 logger = logging.getLogger(__name__)
 
@@ -147,16 +153,6 @@ def _resolve_members(realm: Realm, members: list[TaskStreamMemberPayload]) -> li
     return list(users.values())
 
 
-def _set_task_subscription_preferences(stream: Stream, users: list[UserProfile]) -> None:
-    if not users:
-        return
-    Subscription.objects.filter(
-        recipient=stream.recipient,
-        user_profile__in=users,
-        active=True,
-    ).update(is_muted=True, pin_to_top=False)
-
-
 def _get_task_stream(
     payload: TaskStreamArchivePayload | TaskStreamSubscribersPayload,
 ) -> NodlTaskStreamExtension:
@@ -203,13 +199,26 @@ def sync_task_stream(request: HttpRequest) -> HttpResponse:
             if task_title and existing.task_title != task_title:
                 existing.task_title = task_title
                 existing.save(update_fields=["task_title"])
+            # Reconcile display metadata (mobile renders description as the
+            # task's name and groups by the "Task chats" folder); skip
+            # archived streams.
+            if not stream.deactivated:
+                if task_title:
+                    update_task_stream_description(stream, task_title)
+                if stream.folder_id is None:
+                    do_change_stream_folder(
+                        stream, get_or_create_task_chats_folder(realm), acting_user=None
+                    )
         else:
+            task_title = _clean_task_title(payload.task_title)
             stream, created = create_stream_if_needed(
                 realm,
                 payload.stream_name,
                 invite_only=True,
-                stream_description=f"Task discussion {payload.task_id}",
+                stream_description=task_stream_description(task_title)
+                or f"Task discussion {payload.task_id}",
                 history_public_to_subscribers=False,
+                folder=get_or_create_task_chats_folder(realm),
                 acting_user=None,
             )
             NodlTaskStreamExtension.objects.create(
@@ -222,6 +231,8 @@ def sync_task_stream(request: HttpRequest) -> HttpResponse:
 
         users = _resolve_members(realm, payload.members)
         if users:
+            # Subscriptions are deliberately NOT muted: task chats are the
+            # primary mobile surface and must count/push like normal streams.
             bulk_add_subscriptions(
                 realm,
                 [stream],
@@ -229,7 +240,6 @@ def sync_task_stream(request: HttpRequest) -> HttpResponse:
                 from_user_creation=True,
                 acting_user=None,
             )
-            _set_task_subscription_preferences(stream, users)
 
         return JsonResponse(
             {
@@ -281,7 +291,6 @@ def sync_task_stream_subscribers(request: HttpRequest) -> HttpResponse:
                 from_user_creation=True,
                 acting_user=None,
             )
-            _set_task_subscription_preferences(stream, add_users)
 
         remove_users = list(
             UserProfile.objects.filter(
