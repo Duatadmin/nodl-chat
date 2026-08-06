@@ -683,12 +683,27 @@ def get_stream_topics(request: HttpRequest, stream_id: int) -> HttpResponse:
         allow_empty_topic_name=True,
     )
 
+    # Per-topic unread counts from Zulip's own unread model (one query for
+    # the whole user, filtered to this stream). aggregate_streams groups
+    # topics case-insensitively with first-seen casing, while topic history
+    # canonicalizes to the most recent casing — join on the lowercased name.
+    from zerver.lib.message import aggregate_streams, get_raw_unread_data
+
+    unread_by_topic_lower = {
+        info["topic"].lower(): len(info["unread_message_ids"])
+        for info in aggregate_streams(
+            input_dict=get_raw_unread_data(user)["stream_dict"],
+            allow_empty_topic_name=True,
+        )
+        if info["stream_id"] == stream.id
+    }
+
     # Convert to TopicSerializer format
     topics = [
         TopicSerializer(
             name=topic["name"],
             max_id=topic["max_id"],
-            unread_count=0,  # Known limitation: per-topic unread counts not implemented
+            unread_count=unread_by_topic_lower.get(topic["name"].lower(), 0),
         ).model_dump()
         for topic in topic_history
     ]

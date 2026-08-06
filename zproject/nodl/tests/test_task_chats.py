@@ -468,11 +468,11 @@ class ListDmConversationsIdentityTest(TaskChatsFixtureMixin):
 
         raw = get_raw_unread_data(self.bob)
         expected_one_on_one: dict[int, int] = {}
-        for _mid, info in raw.pm_dict.items():
-            other = info["other_user_id"]
+        for _mid, pm_info in raw["pm_dict"].items():
+            other = pm_info["other_user_id"]
             expected_one_on_one[other] = expected_one_on_one.get(other, 0) + 1
         expected_group: dict[frozenset[int], int] = {}
-        for _mid, info in raw.huddle_dict.items():
+        for _mid, info in raw["huddle_dict"].items():
             ids = frozenset(int(x) for x in info["user_ids_string"].split(",")) - {self.bob.id}
             expected_group[ids] = expected_group.get(ids, 0) + 1
 

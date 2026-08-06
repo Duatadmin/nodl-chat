@@ -49,6 +49,7 @@ logger = logging.getLogger(__name__)
 # Rate limiting configuration
 MESSAGES_READ_LIMIT = 300  # requests per minute
 MESSAGES_WRITE_LIMIT = 60  # messages per minute
+FLAGS_WRITE_LIMIT = 300  # flag updates per minute (mark-read is bursty by design)
 RATE_LIMIT_WINDOW = 60  # seconds
 
 
@@ -1336,11 +1337,12 @@ def mark_messages_as_read(request: HttpRequest) -> HttpResponse:
 
     POST /api/v1/messages/read
 
-    Request body:
+    Request body (exactly one of):
     {
-        "stream_id": 42,          // Optional: mark all in stream
-        "topic": "welcome",       // Optional: mark all in topic (requires stream_id)
-        "message_ids": [1,2,3]    // Optional: mark specific messages
+        "stream_id": 42,          // Mark all in stream
+        "topic": "welcome",       // Optional: restrict to topic (requires stream_id)
+        "dm_user_ids": [9] | [9,12],  // Mark an ENTIRE DM conversation (1:1 or group)
+        "message_ids": [1,2,3]    // Mark specific messages
     }
 
     Response:
@@ -1368,6 +1370,7 @@ def mark_messages_as_read(request: HttpRequest) -> HttpResponse:
     stream_id = body.get("stream_id")
     topic = body.get("topic")
     message_ids = body.get("message_ids")
+    dm_user_ids = body.get("dm_user_ids")
 
     from zerver.models import Stream
 
@@ -1378,17 +1381,53 @@ def mark_messages_as_read(request: HttpRequest) -> HttpResponse:
 
             stream = Stream.objects.get(id=stream_id, realm=user.realm)
             count = do_mark_stream_messages_as_read(user, stream.recipient_id, topic)
+        elif dm_user_ids:
+            # Mark an entire DM conversation (1:1 or group) as read —
+            # conversation-scoped, not limited to whatever page the client
+            # has loaded. Reuses the same bidirectional recipient query as
+            # message listing so 1:1 traffic in both directions is covered.
+            try:
+                dm_ids = [int(uid) for uid in dm_user_ids]
+            except (ValueError, TypeError):
+                return JsonResponse(
+                    {
+                        "result": "error",
+                        "code": "INVALID_PARAMS",
+                        "msg": "dm_user_ids must be a list of user IDs",
+                    },
+                    status=400,
+                )
+            base_query = _build_dm_recipient_query(user, dm_ids)
+            if base_query is None:
+                return JsonResponse(
+                    {"result": "error", "code": "NOT_FOUND", "msg": "DM conversation not found"},
+                    status=404,
+                )
+            unread_ids = list(
+                UserMessage.objects.filter(
+                    user_profile=user,
+                    flags__andz=UserMessage.flags.read.mask,
+                    message__in=base_query,
+                ).values_list("message_id", flat=True)
+            )
+            count = 0
+            # Chunked: do_update_message_flags bulk-updates and emits one
+            # event per call; keep each call bounded like upstream's
+            # MAX_MESSAGES_PER_UPDATE-style limits.
+            for i in range(0, len(unread_ids), 1000):
+                chunk_count, _ = do_update_message_flags(
+                    user, "add", "read", unread_ids[i : i + 1000]
+                )
+                count += chunk_count
         elif message_ids:
             # Mark specific messages as read
-            from zerver.actions.message_flags import do_update_message_flags
-
             count, _ = do_update_message_flags(user, "add", "read", message_ids)
         else:
             return JsonResponse(
                 {
                     "result": "error",
                     "code": "INVALID_PARAMS",
-                    "msg": "Either stream_id or message_ids required",
+                    "msg": "Either stream_id, dm_user_ids or message_ids required",
                 },
                 status=400,
             )
@@ -1559,10 +1598,18 @@ def get_unread_counts(request: HttpRequest) -> HttpResponse:
     {
         "result": "success",
         "unread_counts": {
-            "123": 5,           // stream_id: count
-            "123:welcome": 2    // stream_id:topic: count
+            "stream:123": 5,                // per-stream total (all topics)
+            "stream:123:topic:welcome": 2,  // per (stream, topic)
+            "dm:9": 3,                      // 1:1 DM, keyed by counterpart user id
+            "huddle:9,12,13": 1             // group DM, keyed by user_ids_string
         }
     }
+
+    The key scheme is the web client's canonical `stream:`-prefixed format
+    (useUnreadCounts). Counts are raw per-row numbers — mute state does not
+    change them; any mute/aggregate policy is applied client-side. Topics
+    that differ only by case are one entry (Zulip groups them
+    case-insensitively, first-seen casing wins).
     """
     if request.method != "GET":
         return JsonResponse(
@@ -1573,25 +1620,27 @@ def get_unread_counts(request: HttpRequest) -> HttpResponse:
     user: UserProfile = request.user_profile  # type: ignore[attr-defined]
 
     try:
-        from zerver.lib.message import get_raw_unread_data
+        from zerver.lib.message import aggregate_unread_data, get_raw_unread_data
 
-        raw_unread = get_raw_unread_data(user)
+        aggregated = aggregate_unread_data(get_raw_unread_data(user), allow_empty_topic_name=True)
 
-        # Transform to frontend-expected format
         unread_counts: dict[str, int] = {}
 
-        # Stream unread counts from stream_dict
-        stream_dict = raw_unread.get("stream_dict", {})
-        for stream_id, topic_dict in stream_dict.items():
-            stream_count = 0
-            for topic, msg_ids in topic_dict.items():
-                topic_count = len(msg_ids)
-                stream_count += topic_count
-                # Per-topic count
-                unread_counts[f"{stream_id}:{topic}"] = topic_count
+        stream_totals: dict[int, int] = defaultdict(int)
+        for stream_info in aggregated["streams"]:
+            stream_id = stream_info["stream_id"]
+            count = len(stream_info["unread_message_ids"])
+            stream_totals[stream_id] += count
+            unread_counts[f"stream:{stream_id}:topic:{stream_info['topic']}"] = count
+        for stream_id, total in stream_totals.items():
+            unread_counts[f"stream:{stream_id}"] = total
 
-            # Total stream count
-            unread_counts[str(stream_id)] = stream_count
+        for pm_info in aggregated["pms"]:
+            unread_counts[f"dm:{pm_info['other_user_id']}"] = len(pm_info["unread_message_ids"])
+        for group_info in aggregated["huddles"]:
+            unread_counts[f"huddle:{group_info['user_ids_string']}"] = len(
+                group_info["unread_message_ids"]
+            )
 
         return JsonResponse(
             {
@@ -1600,22 +1649,30 @@ def get_unread_counts(request: HttpRequest) -> HttpResponse:
             }
         )
     except Exception:
+        # A failure here must be VISIBLE: the previous implementation
+        # swallowed a guaranteed TypeError into {"result": "success",
+        # "unread_counts": {}}, which hid the endpoint being broken for
+        # every user with unreads.
         logger.exception("Failed to get unread counts")
         return JsonResponse(
-            {
-                "result": "success",
-                "unread_counts": {},
-            }
+            {"result": "error", "code": "UNREAD_FAILED", "msg": "Failed to get unread counts"},
+            status=500,
         )
 
 
 @csrf_exempt
 @require_jwt_auth
+@rate_limit(key_prefix="flags_write", limit=FLAGS_WRITE_LIMIT)
 def update_flags(request: HttpRequest) -> HttpResponse:
     """POST /api/v1/messages/flags - Update message flags (read, starred, etc.).
 
-    Proxies to Zulip's do_update_message_flags with JWT auth.
-    The Flutter client calls this heavily for mark-as-read.
+    Thin wrapper over Zulip's own update_message_flags view (same idiom as
+    update_flags_narrow below): seeds RequestNotes for JWT-authed requests,
+    injects JSON bodies into request.POST so @typed_endpoint can parse them,
+    then delegates. Form-encoded bodies (what the Flutter client sends) are
+    already in request.POST and pass straight through. Delegating instead of
+    reimplementing keeps validation, response shape, and the log_data summary
+    identical to upstream.
     """
     if request.method != "POST":
         return JsonResponse(
@@ -1625,54 +1682,36 @@ def update_flags(request: HttpRequest) -> HttpResponse:
 
     user: UserProfile = request.user_profile  # type: ignore[attr-defined]
 
-    # Parse JSON body or form-encoded data
+    # Ensure RequestNotes has a client set (required by Zulip views)
+    from zerver.lib.request import RequestNotes
+
+    notes = RequestNotes.get_notes(request)
+    if notes.client is None:
+        notes.client = get_client("nodl-web")
+    if notes.log_data is None:
+        # Direct view calls (tests) bypass the LogRequests middleware; the
+        # upstream view asserts log_data exists before writing its summary.
+        notes.log_data = {}
+
+    # Parse JSON body and inject into request.POST for @typed_endpoint
     try:
         body = json.loads(request.body) if request.body else {}
     except (json.JSONDecodeError, ValueError):
-        body = dict(request.POST.items())
+        body = {}
 
-    op = body.get("op", "")
-    flag = body.get("flag", "")
-    messages = body.get("messages", [])
+    if body:
+        request.POST = request.POST.copy()
+        for key in ("flag", "messages", "op"):
+            if key in body and key not in request.POST:
+                val = body[key]
+                request.POST[key] = (
+                    json.dumps(val) if isinstance(val, list | dict | bool) else str(val)
+                )
 
-    # Validate
-    if op not in ("add", "remove"):
-        return JsonResponse(
-            {"result": "error", "msg": "Missing or invalid 'op' parameter"},
-            status=400,
-        )
-    if not flag:
-        return JsonResponse(
-            {"result": "error", "msg": "Missing 'flag' parameter"},
-            status=400,
-        )
-
-    # Parse messages list from JSON string if form-encoded
-    if isinstance(messages, str):
-        try:
-            messages = json.loads(messages)
-        except (json.JSONDecodeError, ValueError):
-            return JsonResponse(
-                {"result": "error", "msg": "Invalid 'messages' parameter"},
-                status=400,
-            )
-
-    if not isinstance(messages, list):
-        return JsonResponse(
-            {"result": "error", "msg": "'messages' must be a list of message IDs"},
-            status=400,
-        )
+    from zerver.views.message_flags import update_message_flags
 
     try:
-        message_ids = [int(m) for m in messages]
-    except (ValueError, TypeError):
-        return JsonResponse(
-            {"result": "error", "msg": "'messages' must contain valid IDs"},
-            status=400,
-        )
-
-    try:
-        count, ignored = do_update_message_flags(user, op, flag, message_ids)
+        return update_message_flags(request, user)
     except Exception as e:
         logger.warning("[nodl-flags] Error updating flags: %s", e)
         return JsonResponse(
@@ -1680,18 +1719,10 @@ def update_flags(request: HttpRequest) -> HttpResponse:
             status=400,
         )
 
-    return JsonResponse(
-        {
-            "result": "success",
-            "msg": "",
-            "messages": message_ids,
-            "ignored_because_not_subscribed_channels": ignored,
-        }
-    )
-
 
 @csrf_exempt
 @require_jwt_auth
+@rate_limit(key_prefix="flags_write", limit=FLAGS_WRITE_LIMIT)
 def update_flags_narrow(request: HttpRequest) -> HttpResponse:
     """POST /api/v1/messages/flags/narrow - Update flags for messages matching a narrow.
 
