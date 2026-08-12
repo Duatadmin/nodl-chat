@@ -27,7 +27,7 @@ from django.utils.translation import gettext as _
 from zerver.context_processors import get_valid_realm_from_request
 from zerver.decorator import zulip_redirect_to_login
 from zerver.lib.attachments import validate_attachment_request
-from zerver.lib.exceptions import JsonableError
+from zerver.lib.exceptions import InvalidSubdomainError, JsonableError
 from zerver.lib.mime_types import INLINE_MIME_TYPES, guess_type
 from zerver.lib.response import json_success
 from zerver.lib.storage import static_path
@@ -268,15 +268,52 @@ def serve_file(
 
     # For anonymous users accessing from non-subdomain hosts (e.g., Railway),
     # get realm from URL path instead of subdomain lookup
-    if isinstance(maybe_user_profile, AnonymousUser):
+    def realm_from_path() -> Realm | None:
         try:
-            realm = Realm.objects.get(id=int(realm_id_str))
+            return Realm.objects.get(id=int(realm_id_str))
         except (ValueError, Realm.DoesNotExist):
+            return None
+
+    if isinstance(maybe_user_profile, AnonymousUser):
+        realm = realm_from_path()
+        if realm is None:
             return HttpResponseNotFound(_("<p>This file does not exist or has been deleted.</p>"))
     else:
-        realm = get_valid_realm_from_request(request)
+        try:
+            realm = get_valid_realm_from_request(request)
+        except InvalidSubdomainError:
+            # nodl: media is served on the Railway root host, which has no
+            # per-realm subdomain, so an authenticated request can't resolve its
+            # realm this way. Fall back to the realm named in the path (as the
+            # anonymous branch does); per-user authorization below is unchanged.
+            realm = realm_from_path()
+            if realm is None:
+                return HttpResponseNotFound(
+                    _("<p>This file does not exist or has been deleted.</p>")
+                )
 
     is_authorized, attachment = validate_attachment_request(maybe_user_profile, path_id, realm)
+
+    # nodl: media is "anyone with the link" — fully anonymous requests already
+    # get spectator access to any file whose crypto-token URL they hold (see
+    # validate_attachment_request_for_spectator_access). But the mobile app
+    # fetches images with a raw request that carries its Supabase JWT yet not
+    # the X-Workspace-Id header the API client adds, so a shared email resolves
+    # to a UserProfile in the *wrong* realm → the owner/message-access checks
+    # fail → 403, even though the identical anonymous read returns 200. When an
+    # authenticated read is unauthorized, retry it as a spectator against the
+    # realm named in the path. This grants nothing an anonymous client with the
+    # same URL couldn't already fetch, and keeps the spectator rate limit.
+    if (
+        not is_authorized
+        and attachment is not None
+        and not isinstance(maybe_user_profile, AnonymousUser)
+    ):
+        path_realm = realm_from_path()
+        if path_realm is not None:
+            is_authorized, attachment = validate_attachment_request(
+                AnonymousUser(), path_id, path_realm
+            )
 
     def serve_image_error(status: int, image_path: str) -> HttpResponseBase:
         # We cannot use X-Accel-Redirect to offload the serving of
