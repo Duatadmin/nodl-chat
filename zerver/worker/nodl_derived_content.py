@@ -21,7 +21,7 @@ import requests
 from django.conf import settings
 from typing_extensions import override
 
-from nodl.derived_content import voice_note_path_ids
+from nodl.derived_content import translation_text, voice_note_path_ids
 from nodl.extensions.models import NodlRealmExtension
 from zerver.lib.queue import retry_event
 from zerver.models import Message
@@ -110,12 +110,14 @@ class NodlDerivedContentWorker(QueueProcessingWorker):
         else:
             # V3.6: text-translation candidate. The backend gates on the
             # workspace's live translation_enabled setting (202-skips when
-            # off), so we forward every human text message rather than
-            # mirroring that flag here.
+            # off), so we forward every eligible message rather than
+            # mirroring that flag here. Only PLAIN TEXT translates —
+            # attachment messages (any /user_uploads reference) are out of
+            # scope, captions included (founder 2026-08-13).
             if message.sender.is_bot:
                 return
-            text = message.content.strip()
-            if not text:
+            text = translation_text(message.content)
+            if text is None:
                 return
             payload = {
                 "workspace_id": str(extension.nodl_workspace_id),

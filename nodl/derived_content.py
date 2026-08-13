@@ -52,6 +52,20 @@ def voice_note_path_ids(path_ids: Iterable[str]) -> list[str]:
     return [p for p in path_ids if VOICE_NOTE_PATH_ID_RE.search(p)]
 
 
+def translation_text(content: str) -> str | None:
+    """The translatable text of a message, or None when it shouldn't translate.
+
+    V3 scope (founder 2026-08-13): only voice notes and PLAIN TEXT messages
+    are translated. Any /user_uploads reference marks the message as an
+    attachment message (image, document, pasted upload link) — those are
+    skipped entirely, captions included.
+    """
+    text = content.strip()
+    if not text or "/user_uploads/" in text:
+        return None
+    return text
+
+
 def encode_derived_payload(payload: dict[str, Any]) -> str:
     raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
     return base64.urlsafe_b64encode(raw.encode("utf-8")).decode("ascii")

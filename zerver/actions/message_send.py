@@ -1277,19 +1277,22 @@ def do_send_messages(
 
         # NODL MODIFICATION START — voice-messaging V2.2/V3.6: derived-content
         # events for zerver/worker/nodl_derived_content.py. A voice-note
-        # attachment (voice-<epoch>.m4a) queues transcription; otherwise any
-        # human text message queues a translation candidate (empty path_ids —
-        # the worker reads content from the DB; nodl-backend owns the
-        # per-workspace translation on/off gate, so no realm flag can go
-        # stale here).
-        from nodl.derived_content import voice_note_path_ids
+        # attachment (voice-<epoch>.m4a) queues transcription; otherwise a
+        # human PLAIN-TEXT message queues a translation candidate (empty
+        # path_ids — the worker reads content from the DB; nodl-backend owns
+        # the per-workspace translation on/off gate, so no realm flag can go
+        # stale here). Attachment messages (images, documents — any
+        # /user_uploads reference) are out of translation scope entirely,
+        # captions included (founder 2026-08-13).
+        from nodl.derived_content import translation_text, voice_note_path_ids
 
         nodl_voice_paths = voice_note_path_ids(
             send_request.rendering_result.potential_attachment_path_ids
         )
         if nodl_voice_paths or (
             not send_request.message.sender.is_bot
-            and send_request.message.content.strip()
+            and not send_request.rendering_result.potential_attachment_path_ids
+            and translation_text(send_request.message.content) is not None
         ):
             queue_event_on_commit(
                 "nodl_derived_content",

@@ -14,6 +14,7 @@ from nodl.derived_content import (
     build_derived_block,
     decode_derived_payload,
     encode_derived_payload,
+    translation_text,
     voice_note_path_ids,
 )
 
@@ -37,6 +38,30 @@ class VoiceNotePathIdTest(unittest.TestCase):
     def test_does_not_match_voice_substring_in_directory(self) -> None:
         # Only the FILENAME segment may carry the discriminator.
         self.assertEqual(voice_note_path_ids(["voice-1/other.m4a"]), [])
+
+
+class TranslationTextTest(unittest.TestCase):
+    """V3 scope: only PLAIN TEXT messages translate (voice has its own
+    path); any /user_uploads reference = attachment message = skipped."""
+
+    def test_plain_text_passes_through_stripped(self) -> None:
+        self.assertEqual(
+            translation_text("  Бетон привезли в 8 утра  "),
+            "Бетон привезли в 8 утра",
+        )
+
+    def test_empty_content_is_none(self) -> None:
+        self.assertIsNone(translation_text(""))
+        self.assertIsNone(translation_text("   \n  "))
+
+    def test_attachment_messages_are_skipped_captions_included(self) -> None:
+        self.assertIsNone(translation_text("[photo.jpg](/user_uploads/2/ab/x/photo.jpg)"))
+        self.assertIsNone(
+            translation_text("смотри фото\n[photo.jpg](/user_uploads/2/ab/x/photo.jpg)")
+        )
+        self.assertIsNone(
+            translation_text("вот файл https://chat.example/user_uploads/2/ab/x/report.pdf")
+        )
 
 
 class PayloadCodecTest(unittest.TestCase):
