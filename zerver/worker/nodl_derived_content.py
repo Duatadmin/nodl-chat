@@ -22,7 +22,11 @@ from django.conf import settings
 from typing_extensions import override
 
 from nodl.derived_content import translation_text, voice_note_path_ids
-from nodl.extensions.models import NodlRealmExtension
+from nodl.extensions.models import (
+    NodlRealmExtension,
+    NodlRealmUserExtension,
+    NodlUserExtension,
+)
 from zerver.lib.queue import retry_event
 from zerver.models import Message
 from zerver.worker.base import QueueProcessingWorker, assign_queue
@@ -30,6 +34,27 @@ from zerver.worker.base import QueueProcessingWorker, assign_queue
 logger = logging.getLogger(__name__)
 
 REQUEST_TIMEOUT_SECONDS = 15
+
+
+def _sender_nodl_user_id(message: Message) -> str | None:
+    """Resolve the Zulip sender to their nodl (Supabase) user id.
+
+    Realm-scoped mapping first (one human can live in several workspace
+    realms), legacy global mapping as fallback. None when unmapped — the
+    backend then simply cannot exclude the sender's language (safe default).
+    """
+    supabase_id = (
+        NodlRealmUserExtension.objects.filter(zulip_user_id=message.sender_id)
+        .values_list("supabase_user_id", flat=True)
+        .first()
+    )
+    if supabase_id is None:
+        supabase_id = (
+            NodlUserExtension.objects.filter(zulip_user_id=message.sender_id)
+            .values_list("supabase_user_id", flat=True)
+            .first()
+        )
+    return str(supabase_id) if supabase_id else None
 
 
 def _presign_attachment(path_id: str) -> str:
@@ -106,6 +131,7 @@ class NodlDerivedContentWorker(QueueProcessingWorker):
                 "message_id": message_id,
                 "kind": "voice_transcript",
                 "attachments": attachments,
+                "sender_user_id": _sender_nodl_user_id(message),
             }
         else:
             # V3.6: text-translation candidate. The backend gates on the
@@ -124,6 +150,7 @@ class NodlDerivedContentWorker(QueueProcessingWorker):
                 "message_id": message_id,
                 "kind": "text_translation",
                 "text": text,
+                "sender_user_id": _sender_nodl_user_id(message),
             }
 
         try:
