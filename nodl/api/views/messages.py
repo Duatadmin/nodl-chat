@@ -7,6 +7,7 @@ Bearer token (JWT) authentication, not browser session cookies.
 
 import json
 import logging
+import re
 from collections import defaultdict
 from collections.abc import Callable
 from contextlib import suppress
@@ -1092,6 +1093,10 @@ def delete_message(request: HttpRequest, message_id: int) -> HttpResponse:
 
 DM_PREVIEW_MAX_CHARS = 100
 
+# The voice-note filename discriminator (`voice-<epoch>.m4a`) as it appears
+# in preview text extracted from rendered_content.
+_VOICE_FILENAME_RE = re.compile(r"voice-\d+\.m4a")
+
 
 def _dm_preview_text(message: Message) -> str:
     """Plain-text preview of a message, matching how clients render it.
@@ -1113,6 +1118,15 @@ def _dm_preview_text(message: Message) -> str:
             # An lxml parse failure must not 500 the inbox; raw content is
             # an acceptable degraded preview.
             logger.exception("Failed to render DM preview for message %d", message.id)
+    # Voice notes (V2.11): never leak the raw `voice-….m4a` filename into the
+    # preview — show `🎤 <transcript>` once the derived transcript is attached
+    # to rendered_content, or a bare `🎤 Voice message` before it. Mirrors
+    # the mobile client's messagePreviewText so polled and live-derived
+    # previews render identically.
+    if _VOICE_FILENAME_RE.search(text):
+        text = _VOICE_FILENAME_RE.sub("", text)
+        text = " ".join(text.split())
+        text = f"🎤 {text}" if text else "🎤 Voice message"
     text = " ".join(text.split())
     if len(text) > DM_PREVIEW_MAX_CHARS:
         text = text[:DM_PREVIEW_MAX_CHARS] + "…"

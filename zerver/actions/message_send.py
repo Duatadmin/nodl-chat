@@ -1275,6 +1275,25 @@ def do_send_messages(
             }
             queue_event_on_commit("embed_links", event_data)
 
+        # NODL MODIFICATION START — voice-messaging V2.2: a voice-note
+        # attachment (voice-<epoch>.m4a) queues derived-content work
+        # (transcription) for zerver/worker/nodl_derived_content.py.
+        from nodl.derived_content import voice_note_path_ids
+
+        nodl_voice_paths = voice_note_path_ids(
+            send_request.rendering_result.potential_attachment_path_ids
+        )
+        if nodl_voice_paths:
+            queue_event_on_commit(
+                "nodl_derived_content",
+                {
+                    "message_id": send_request.message.id,
+                    "message_realm_id": send_request.realm.id,
+                    "path_ids": nodl_voice_paths,
+                },
+            )
+        # NODL MODIFICATION END
+
         # Check if this is a 1:1 DM between a user and the Welcome Bot,
         # in which case we may want to send an automated response.
         if not send_request.message.is_channel_message and len(send_request.active_user_ids) == 2:

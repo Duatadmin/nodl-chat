@@ -787,5 +787,15 @@ NODL_SUPABASE_SERVICE_ROLE_KEY: str = os.environ.get("SUPABASE_KEY", "")
 # Maximum number of phone hashes per contacts/match request (Story 4.1).
 NODL_CONTACTS_MATCH_LIMIT: int = 500
 
+# Voice-messaging Phase V2 (derived content / transcription).
+# nodl-backend base URL + reciprocal service key for the chat → backend
+# derive call made by zerver/worker/nodl_derived_content.py. get_secret
+# falls back to the BACKEND_SERVICE_KEY env var (Railway).
+NODL_BACKEND_URL: str = os.environ.get("NODL_BACKEND_URL", "")
+BACKEND_SERVICE_KEY: str | None = get_secret("backend_service_key")
+# Presigned R2 GET TTL for AssemblyAI pulls: 24h retry safety margin
+# (mirrors nodl-backend's meeting_audio_presigned_ttl_seconds).
+NODL_DERIVED_PRESIGN_TTL: int = int(os.environ.get("NODL_DERIVED_PRESIGN_TTL", "86400"))
+
 # NODL MODIFICATION END
 ########################################################################
