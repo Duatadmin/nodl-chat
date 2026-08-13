@@ -1,3 +1,6 @@
+import logging
+import threading
+import time
 from datetime import timedelta
 from typing import Any
 
@@ -52,6 +55,42 @@ def remove_attachment(user_profile: UserProfile, attachment: Attachment) -> None
     attachment.delete()
 
 
+# S4.2: process-local fallback rate cap for anonymous ("spectator") attachment
+# access, used ONLY when the Redis-backed limiter is unavailable. It is coarse
+# and per-process by design — it exists to bound abuse during a Redis outage,
+# not to gate legitimate traffic. Generous default; override via
+# settings.SPECTATOR_ATTACHMENT_FALLBACK_ACCESS_LIMIT.
+_FALLBACK_WINDOW_SECONDS = 60
+_FALLBACK_DEFAULT_LIMIT = 120
+_FALLBACK_MAX_TRACKED_FILES = 50_000
+_fallback_lock = threading.Lock()
+_fallback_hits: dict[str, tuple[float, int]] = {}
+
+
+def _fallback_spectator_access_ok(path_id: str) -> bool:
+    """Coarse per-file fixed-window cap for the Redis-down fallback path.
+
+    Returns True while the file is under the per-process window limit, False
+    once it is exceeded. Per-process and best-effort — several web workers each
+    keep their own counter — which is acceptable for an outage backstop.
+    """
+    limit = getattr(
+        settings, "SPECTATOR_ATTACHMENT_FALLBACK_ACCESS_LIMIT", _FALLBACK_DEFAULT_LIMIT
+    )
+    now = time.monotonic()
+    with _fallback_lock:
+        # Bound memory if an outage touches a very large number of distinct
+        # files: reset wholesale rather than grow without limit.
+        if len(_fallback_hits) > _FALLBACK_MAX_TRACKED_FILES:
+            _fallback_hits.clear()
+        window_start, count = _fallback_hits.get(path_id, (now, 0))
+        if now - window_start >= _FALLBACK_WINDOW_SECONDS:
+            window_start, count = now, 0
+        count += 1
+        _fallback_hits[path_id] = (window_start, count)
+        return count <= limit
+
+
 def validate_attachment_request_for_spectator_access(realm: Realm, attachment: Attachment) -> bool:
     if attachment.realm != realm:
         return False
@@ -74,14 +113,20 @@ def validate_attachment_request_for_spectator_access(realm: Realm, attachment: A
         except RateLimitedError:
             return False
         except Exception:
-            # Redis unavailable or other rate limiter error — allow access
-            # rather than crashing. File URLs contain crypto tokens so
-            # anonymous access is safe.
-            import logging
-
-            logging.getLogger(__name__).warning(
-                "Rate limiter failed for spectator attachment access", exc_info=True
+            # S4.2: the Redis-backed limiter is unavailable. Fail OPEN (serve the
+            # file — crypto-token URLs make anonymous reads safe, and blocking
+            # would break ALL media the moment Redis hiccups), but (a) emit a
+            # STABLE, distinct error line an ops alert can match, and (b) apply a
+            # generous process-local fallback cap so an outage cannot become an
+            # unbounded-access amplifier.
+            logging.getLogger(__name__).error(
+                "nodl.media.rate_limiter_unavailable: spectator attachment "
+                "access served without Redis rate limiting (fail-open); "
+                "applying process-local fallback cap",
+                exc_info=True,
             )
+            if not _fallback_spectator_access_ok(attachment.path_id):
+                return False
 
     return True
 

@@ -210,9 +210,30 @@ def test_source_guard_serve_file_resolves_anonymous_realm_from_path() -> None:
     realm (or none) and every media fetch 404s.
     """
     body = _definition_source(UPLOAD_VIEWS_PY, "serve_file")
+    tree = ast.parse(body)
+
+    # 06737d414f's realm-from-path resolution was refactored into a nested
+    # `realm_from_path()` helper by d0892f54c5 (which also gave the authenticated
+    # path the same fallback). The protection is unchanged; guard the new shape:
+    # a resolver that reads the realm id out of the URL path.
+    resolver = None
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == "realm_from_path":
+            resolver = node
+            break
+    assert resolver is not None, (
+        f"serve_file no longer defines the realm_from_path resolver in {UPLOAD_VIEWS_PY}; "
+        "06737d414f has been reverted"
+    )
+    resolver_src = ast.dump(resolver)
+    assert "realm_id_str" in resolver_src and "Realm" in resolver_src, (
+        "realm_from_path no longer resolves the realm from the URL path's realm "
+        "id (06737d414f); anonymous media fetches will 404 on the single-domain "
+        "Railway deploy"
+    )
 
     anonymous_branch = None
-    for node in ast.walk(ast.parse(body)):
+    for node in ast.walk(tree):
         if not isinstance(node, ast.If):
             continue
         test_src = ast.dump(node.test)
@@ -226,7 +247,7 @@ def test_source_guard_serve_file_resolves_anonymous_realm_from_path() -> None:
     )
 
     branch_src = "\n".join(ast.dump(stmt) for stmt in anonymous_branch.body)
-    assert "realm_id_str" in branch_src and "Realm" in branch_src, (
+    assert "realm_from_path" in branch_src, (
         "the anonymous branch of serve_file no longer resolves the realm from "
         "the URL path (06737d414f); anonymous media fetches will 404 on the "
         "single-domain Railway deploy"
@@ -290,6 +311,30 @@ def test_source_guard_rest_dispatch_keeps_the_nodl_auth_branches() -> None:
         "rest_dispatch no longer strips an unparseable Authorization header "
         "before falling through to anonymous access (785a9f6f83); clients "
         "sending Bearer tokens on file paths will get errors instead of files"
+    )
+
+
+def test_source_guard_rate_limiter_failure_fails_open_with_alert_and_cap() -> None:
+    """Guards S4.2 (zerver/lib/attachments.py).
+
+    A Redis/limiter outage on the anonymous attachment path must fail OPEN
+    (never block media on an infra hiccup) while staying visible (a stable
+    alert line) and bounded (a process-local fallback cap).  If any of the three
+    reverts, either media breaks on every Redis blip or an outage becomes an
+    unbounded-access hole.
+    """
+    body = _definition_source(ATTACHMENTS_PY, "validate_attachment_request_for_spectator_access")
+    assert "nodl.media.rate_limiter_unavailable" in body, (
+        "the stable alert message for a limiter outage is gone (S4.2); ops "
+        "alerting on Redis-down media access will silently stop firing"
+    )
+    assert "_fallback_spectator_access_ok" in body, (
+        "the process-local fallback cap is gone (S4.2); a Redis outage now "
+        "allows unbounded anonymous attachment access"
+    )
+    assert ".error(" in body, (
+        "the limiter-outage log was downgraded from error (S4.2 alerting relies "
+        "on a stable ERROR line)"
     )
 
 
@@ -649,3 +694,70 @@ def test_rest_dispatch_strips_unparseable_authorization_and_serves_anonymously()
         assert response.status_code == 200, f"{header!r} was not stripped"
         assert "HTTP_AUTHORIZATION" not in request.META
         assert isinstance(view.call_args.args[1], AnonymousUser)
+
+
+@requires_django
+def test_redis_down_fails_open_and_alerts(caplog: pytest.LogCaptureFixture) -> None:
+    """S4.2 — a limiter/Redis failure must fail OPEN and emit a stable alert.
+
+    File URLs carry crypto tokens, so blocking anonymous access on a limiter
+    outage would break all media for no security gain.  But the outage must be
+    visible: a distinct, stable ERROR message an ops alert can match.
+    """
+    import logging as _logging
+
+    from django.test import override_settings
+
+    import zerver.lib.attachments as attachments_mod
+    from zerver.lib.attachments import validate_attachment_request_for_spectator_access
+
+    realm = _fake_realm(7)
+    attachment = _fake_attachment(realm)
+    attachments_mod._fallback_hits.clear()
+
+    with (
+        override_settings(RATE_LIMITING=True),
+        mock.patch(
+            "zerver.lib.rate_limiter.rate_limit_spectator_attachment_access_by_file",
+            side_effect=RuntimeError("redis down"),
+        ),
+        caplog.at_level(_logging.ERROR, logger="zerver.lib.attachments"),
+    ):
+        # Fail open: the file is still served despite the limiter being down.
+        assert validate_attachment_request_for_spectator_access(realm, attachment) is True
+
+    assert any(
+        "nodl.media.rate_limiter_unavailable" in record.getMessage() for record in caplog.records
+    ), "the Redis-down fallback must emit the stable alert message for ops"
+
+
+@requires_django
+def test_redis_down_fallback_cap_denies_after_limit() -> None:
+    """S4.2 — the process-local fallback cap bounds abuse during a Redis outage.
+
+    Fail-open must not mean unlimited: once a single file blows past the
+    (generous) per-process window limit while Redis is down, access is denied.
+    """
+    from django.test import override_settings
+
+    import zerver.lib.attachments as attachments_mod
+    from zerver.lib.attachments import validate_attachment_request_for_spectator_access
+
+    realm = _fake_realm(7)
+    attachment = _fake_attachment(realm)
+    attachments_mod._fallback_hits.clear()
+
+    with (
+        override_settings(RATE_LIMITING=True, SPECTATOR_ATTACHMENT_FALLBACK_ACCESS_LIMIT=3),
+        mock.patch(
+            "zerver.lib.rate_limiter.rate_limit_spectator_attachment_access_by_file",
+            side_effect=RuntimeError("redis down"),
+        ),
+    ):
+        results = [
+            validate_attachment_request_for_spectator_access(realm, attachment) for _ in range(4)
+        ]
+
+    assert results == [True, True, True, False], (
+        f"a fallback cap of 3 should allow 3 then deny the 4th; got {results}"
+    )
