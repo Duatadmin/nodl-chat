@@ -23,6 +23,7 @@ from nodl.api.views.messages import (
     mark_messages_as_read,
     messages_dispatch,
     mute_dm_user,
+    search_messages,
     send_message,
     unmute_dm_user,
     update_flags,
@@ -127,6 +128,8 @@ urlpatterns = [
     # Message REST API endpoints - authenticated via JWT
     path("api/v1/messages", messages_dispatch, name="nodl_messages"),
     path("api/v1/messages/send", send_message, name="nodl_send_message"),
+    # MUST come before /messages/<int:message_id> so "search" isn't shadowed
+    path("api/v1/messages/search", search_messages, name="nodl_search_messages"),
     path("api/v1/messages/<int:message_id>", get_message, name="nodl_get_message"),
     path("api/v1/messages/<int:message_id>/edit", edit_message, name="nodl_edit_message"),
     path("api/v1/messages/<int:message_id>/delete", delete_message, name="nodl_delete_message"),

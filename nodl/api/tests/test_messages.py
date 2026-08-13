@@ -20,10 +20,12 @@ from unittest.mock import MagicMock, patch
 from django.test import RequestFactory, TestCase
 
 from nodl.api.views.messages import (
+    _parse_search_query,
     delete_message,
     edit_message,
     get_message,
     list_messages,
+    search_messages,
     send_message,
 )
 
@@ -825,3 +827,155 @@ class TestSerializers(TestCase):
 
         with self.assertRaises(ValidationError):
             MessageUpdatePayload(content="")  # min_length=1
+
+
+class TestParseSearchQuery(TestCase):
+    """Test cases for the search query parser."""
+
+    def test_plain_words(self) -> None:
+        filters, words = _parse_search_query("hello world")
+        self.assertEqual(filters, [])
+        self.assertEqual(words, ["hello", "world"])
+
+    def test_quoted_phrase(self) -> None:
+        filters, words = _parse_search_query('"hello world" extra')
+        self.assertEqual(filters, [])
+        self.assertEqual(words, ["hello world", "extra"])
+
+    def test_operators(self) -> None:
+        filters, words = _parse_search_query("stream:general topic:standup sender:alice@x.com hi")
+        self.assertEqual(
+            filters,
+            [
+                (False, "stream", "general"),
+                (False, "topic", "standup"),
+                (False, "sender", "alice@x.com"),
+            ],
+        )
+        self.assertEqual(words, ["hi"])
+
+    def test_negated_operator(self) -> None:
+        filters, words = _parse_search_query("-is:dm report")
+        self.assertEqual(filters, [(True, "is", "dm")])
+        self.assertEqual(words, ["report"])
+
+    def test_quoted_operator_value(self) -> None:
+        filters, words = _parse_search_query('topic:"daily standup" notes')
+        self.assertEqual(filters, [(False, "topic", "daily standup")])
+        self.assertEqual(words, ["notes"])
+
+    def test_unknown_operator_treated_as_word(self) -> None:
+        filters, words = _parse_search_query("re:something")
+        self.assertEqual(filters, [])
+        self.assertEqual(words, ["re:something"])
+
+
+class TestSearchMessages(TestCase):
+    """Test cases for GET /api/v1/messages/search."""
+
+    def setUp(self) -> None:
+        self.factory = RequestFactory()
+        self.user = MockUserProfile()
+
+    def _chainable_qs(self, message_ids: list[int], total: int) -> MagicMock:
+        """Build a chainable queryset mock that yields the given ids."""
+        qs = MagicMock()
+        qs.filter.return_value = qs
+        qs.exclude.return_value = qs
+        qs.count.return_value = total
+        ordered = MagicMock()
+        qs.order_by.return_value = ordered
+        values = MagicMock()
+        ordered.values_list.return_value = values
+        values.__getitem__ = MagicMock(return_value=message_ids)
+        return qs
+
+    def test_unauthenticated_returns_401(self) -> None:
+        request = self.factory.get("/api/v1/messages/search?query=hello")
+        request.user_profile = None
+
+        response = search_messages(request)
+
+        self.assertEqual(response.status_code, 401)
+
+    def test_post_method_not_allowed(self) -> None:
+        request = self.factory.post("/api/v1/messages/search")
+        request.user_profile = self.user
+
+        response = search_messages(request)
+
+        self.assertEqual(response.status_code, 405)
+
+    def test_missing_query_returns_400(self) -> None:
+        request = self.factory.get("/api/v1/messages/search")
+        request.user_profile = self.user
+
+        response = search_messages(request)
+
+        self.assertEqual(response.status_code, 400)
+        data = json.loads(response.content)
+        self.assertEqual(data["code"], "INVALID_PARAMS")
+
+    def test_invalid_pagination_returns_400(self) -> None:
+        request = self.factory.get("/api/v1/messages/search?query=hello&page=abc")
+        request.user_profile = self.user
+
+        response = search_messages(request)
+
+        self.assertEqual(response.status_code, 400)
+
+    @patch("nodl.api.views.messages.messages_for_ids")
+    @patch("nodl.api.views.messages.UserMessage")
+    def test_search_returns_messages(
+        self,
+        mock_user_message: MagicMock,
+        mock_messages_for_ids: MagicMock,
+    ) -> None:
+        qs = self._chainable_qs(message_ids=[7, 5], total=2)
+        mock_user_message.objects = qs
+        mock_messages_for_ids.return_value = [
+            {"id": 7, "content": "hello again"},
+            {"id": 5, "content": "hello world"},
+        ]
+
+        request = self.factory.get("/api/v1/messages/search?query=hello")
+        request.user_profile = self.user
+
+        response = search_messages(request)
+
+        self.assertEqual(response.status_code, 200)
+        data = json.loads(response.content)
+        self.assertEqual(data["result"], "success")
+        self.assertEqual(data["total"], 2)
+        self.assertEqual([m["id"] for m in data["messages"]], [7, 5])
+        self.assertEqual(data["highlights"], {})
+        # Scoped through UserMessage for the requesting user
+        first_filter_kwargs = qs.filter.call_args_list[0].kwargs
+        self.assertEqual(first_filter_kwargs.get("user_profile"), self.user)
+        # Word filter applied via icontains
+        self.assertTrue(
+            any("message__content__icontains" in call.kwargs for call in qs.filter.call_args_list)
+        )
+
+    @patch("zerver.models.Stream")
+    @patch("nodl.api.views.messages.UserMessage")
+    def test_unknown_stream_returns_empty(
+        self,
+        mock_user_message: MagicMock,
+        mock_stream: MagicMock,
+    ) -> None:
+        empty_qs = self._chainable_qs(message_ids=[], total=0)
+        qs = self._chainable_qs(message_ids=[], total=0)
+        qs.none.return_value = empty_qs
+        mock_user_message.objects = qs
+        mock_stream.objects.filter.return_value.first.return_value = None
+
+        request = self.factory.get("/api/v1/messages/search?query=stream:nope+hello")
+        request.user_profile = self.user
+
+        response = search_messages(request)
+
+        self.assertEqual(response.status_code, 200)
+        data = json.loads(response.content)
+        self.assertEqual(data["total"], 0)
+        self.assertEqual(data["messages"], [])
