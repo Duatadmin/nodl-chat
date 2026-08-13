@@ -67,13 +67,24 @@ def decode_derived_payload(encoded: str) -> dict[str, Any] | None:
     return decoded if isinstance(decoded, dict) else None
 
 
-def build_derived_block(payload: dict[str, Any], transcript: str) -> str:
-    """Render the appendable HTML block for one derived-content payload."""
+def build_derived_block(payload: dict[str, Any], transcript: str | None) -> str:
+    """Render the appendable HTML block for one derived-content payload.
+
+    Voice blocks carry a visible transcript paragraph; text-translation
+    blocks (V3) are comment-only — the original text is already visible and
+    translations live in the payload for capable clients. Old clients drop
+    an unknown top-level comment silently, so both degrade cleanly.
+    """
     encoded = encode_derived_payload(payload)
-    return f"\n<!-- nodl-derived:v1:{encoded} -->\n<p>{escape(transcript)}</p>"
+    block = f"\n<!-- nodl-derived:v1:{encoded} -->"
+    if transcript:
+        block += f"\n<p>{escape(transcript)}</p>"
+    return block
 
 
-def apply_derived_block(rendered_content: str, payload: dict[str, Any], transcript: str) -> str:
+def apply_derived_block(
+    rendered_content: str, payload: dict[str, Any], transcript: str | None
+) -> str:
     """Append (or idempotently replace) the derived block in rendered HTML."""
     base = DERIVED_BLOCK_RE.sub("", rendered_content)
     return base + build_derived_block(payload, transcript)

@@ -102,6 +102,49 @@ class DerivedBlockTest(unittest.TestCase):
         assert decoded is not None
         self.assertEqual(decoded["kind"], "voice_transcript")
 
+    def test_text_translation_block_is_comment_only(self) -> None:
+        # V3: text-translation blocks have NO visible paragraph — the
+        # original message is already on screen; translations live only in
+        # the payload. Old clients drop the top-level comment silently.
+        payload = {
+            "v": 1,
+            "kind": "text_translation",
+            "translations": {"en": "Concrete was delivered"},
+        }
+        block = build_derived_block(payload, None)
+        self.assertRegex(block, r"^\n<!-- nodl-derived:v1:[A-Za-z0-9_=-]+ -->$")
+        self.assertNotIn("<p>", block)
+
+    def test_comment_only_block_replaced_idempotently(self) -> None:
+        text_rendered = "<p>Бетон привезли в 8 утра</p>"
+        payload = {"v": 1, "kind": "text_translation", "translations": {"en": "a"}}
+        first = apply_derived_block(text_rendered, payload, None)
+        second = apply_derived_block(
+            first,
+            {**payload, "translations": {"en": "b", "ru": "в"}},
+            None,
+        )
+        self.assertEqual(len(DERIVED_BLOCK_RE.findall(second)), 1)
+        self.assertTrue(second.startswith(text_rendered))
+        # The message's own <p> must never be eaten by the replace regex.
+        self.assertIn("Бетон привезли в 8 утра", second)
+
+    def test_voice_block_upgraded_with_translations(self) -> None:
+        # A voice message first gets its transcript block, then the
+        # translations re-attach replaces it wholesale.
+        first = apply_derived_block(RENDERED, self.PAYLOAD, "привет")
+        upgraded_payload = {**self.PAYLOAD, "translations": {"en": "hi"}}
+        second = apply_derived_block(first, upgraded_payload, "привет")
+        self.assertEqual(len(DERIVED_BLOCK_RE.findall(second)), 1)
+        import re
+
+        match = re.search(r"<!--\s*nodl-derived:v1:([A-Za-z0-9_=-]+)\s*-->", second)
+        assert match is not None
+        decoded = decode_derived_payload(match.group(1))
+        assert decoded is not None
+        self.assertEqual(decoded["translations"], {"en": "hi"})
+        self.assertIn("<p>привет</p>", second)
+
 
 if __name__ == "__main__":
     unittest.main()

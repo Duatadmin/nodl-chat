@@ -65,15 +65,6 @@ class NodlDerivedContentWorker(QueueProcessingWorker):
             )
             return
 
-        if settings.LOCAL_UPLOADS_DIR is not None:
-            # Dev/local-uploads deployments can't presign — nothing to do.
-            logger.warning(
-                "nodl_derived_content: local uploads backend; dropping event "
-                "for message %s",
-                message_id,
-            )
-            return
-
         message = Message.objects.filter(id=message_id).first()
         if message is None:
             return  # Deleted before we got to it.
@@ -92,25 +83,46 @@ class NodlDerivedContentWorker(QueueProcessingWorker):
 
         # Re-filter defensively (the hook already filtered).
         path_ids = voice_note_path_ids(event["path_ids"])
-        if not path_ids:
-            return
-
-        attachments = [
-            {
-                "path_id": path_id,
-                "presigned_url": _presign_attachment(path_id),
-                "filename": path_id.rsplit("/", 1)[-1],
-                "mime": "audio/mp4",
+        if path_ids:
+            if settings.LOCAL_UPLOADS_DIR is not None:
+                # Dev/local-uploads deployments can't presign — nothing to do.
+                logger.warning(
+                    "nodl_derived_content: local uploads backend; dropping "
+                    "voice event for message %s",
+                    message_id,
+                )
+                return
+            attachments = [
+                {
+                    "path_id": path_id,
+                    "presigned_url": _presign_attachment(path_id),
+                    "filename": path_id.rsplit("/", 1)[-1],
+                    "mime": "audio/mp4",
+                }
+                for path_id in path_ids
+            ]
+            payload = {
+                "workspace_id": str(extension.nodl_workspace_id),
+                "message_id": message_id,
+                "kind": "voice_transcript",
+                "attachments": attachments,
             }
-            for path_id in path_ids
-        ]
-
-        payload = {
-            "workspace_id": str(extension.nodl_workspace_id),
-            "message_id": message_id,
-            "kind": "voice_transcript",
-            "attachments": attachments,
-        }
+        else:
+            # V3.6: text-translation candidate. The backend gates on the
+            # workspace's live translation_enabled setting (202-skips when
+            # off), so we forward every human text message rather than
+            # mirroring that flag here.
+            if message.sender.is_bot:
+                return
+            text = message.content.strip()
+            if not text:
+                return
+            payload = {
+                "workspace_id": str(extension.nodl_workspace_id),
+                "message_id": message_id,
+                "kind": "text_translation",
+                "text": text,
+            }
 
         try:
             response = requests.post(
@@ -152,9 +164,9 @@ class NodlDerivedContentWorker(QueueProcessingWorker):
             return
 
         logger.info(
-            "nodl_derived_content: queued derive for message %s (%d attachment(s))",
+            "nodl_derived_content: queued %s derive for message %s",
+            payload["kind"],
             message_id,
-            len(attachments),
         )
 
     def _retry(self, event: dict[str, Any]) -> None:

@@ -1275,15 +1275,22 @@ def do_send_messages(
             }
             queue_event_on_commit("embed_links", event_data)
 
-        # NODL MODIFICATION START — voice-messaging V2.2: a voice-note
-        # attachment (voice-<epoch>.m4a) queues derived-content work
-        # (transcription) for zerver/worker/nodl_derived_content.py.
+        # NODL MODIFICATION START — voice-messaging V2.2/V3.6: derived-content
+        # events for zerver/worker/nodl_derived_content.py. A voice-note
+        # attachment (voice-<epoch>.m4a) queues transcription; otherwise any
+        # human text message queues a translation candidate (empty path_ids —
+        # the worker reads content from the DB; nodl-backend owns the
+        # per-workspace translation on/off gate, so no realm flag can go
+        # stale here).
         from nodl.derived_content import voice_note_path_ids
 
         nodl_voice_paths = voice_note_path_ids(
             send_request.rendering_result.potential_attachment_path_ids
         )
-        if nodl_voice_paths:
+        if nodl_voice_paths or (
+            not send_request.message.sender.is_bot
+            and send_request.message.content.strip()
+        ):
             queue_event_on_commit(
                 "nodl_derived_content",
                 {

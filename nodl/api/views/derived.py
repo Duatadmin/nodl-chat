@@ -32,10 +32,15 @@ logger = logging.getLogger(__name__)
 
 class DerivedAttachPayload(BaseModel):
     kind: str
-    transcript: str
+    # Voice rows always carry a transcript; text-translation rows (V3) don't
+    # — their visible original is the message itself.
+    transcript: str | None = None
     source_lang: str | None = None
     duration_seconds: float | None = None
     confidence: float | None = None
+    # V3: faithful per-language translations {lang: text} for opted-in
+    # readers. Canonical copies never travel here (AI-side only).
+    translations: dict[str, str] | None = None
 
 
 @csrf_exempt  # type: ignore[untyped-decorator]
@@ -67,9 +72,19 @@ def attach_derived_content(request: HttpRequest, message_id: int) -> HttpRespons
             status=400,
         )
 
-    if not payload.transcript.strip():
+    transcript = (payload.transcript or "").strip() or None
+    translations = {
+        lang: text.strip()
+        for lang, text in (payload.translations or {}).items()
+        if text and text.strip()
+    }
+    if transcript is None and not translations:
         return JsonResponse(
-            {"result": "error", "code": "EMPTY_TRANSCRIPT", "msg": "Transcript empty"},
+            {
+                "result": "error",
+                "code": "EMPTY_PAYLOAD",
+                "msg": "Neither transcript nor translations present",
+            },
             status=400,
         )
 
@@ -89,13 +104,15 @@ def attach_derived_content(request: HttpRequest, message_id: int) -> HttpRespons
         derived_payload = {
             "v": DERIVED_PAYLOAD_VERSION,
             "kind": payload.kind,
-            "transcript": payload.transcript,
+            "transcript": transcript,
             "source_lang": payload.source_lang,
             "duration_s": payload.duration_seconds,
             "confidence": payload.confidence,
         }
+        if translations:
+            derived_payload["translations"] = translations
         new_rendered_content = apply_derived_block(
-            message.rendered_content or "", derived_payload, payload.transcript
+            message.rendered_content or "", derived_payload, transcript
         )
         do_update_embedded_data(message.sender, message, new_rendered_content)
 
