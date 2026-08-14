@@ -360,6 +360,12 @@ def list_messages(request: HttpRequest) -> HttpResponse:
     num_before = min(max(0, num_before), 200)
     num_after = min(max(0, num_after), 200)
 
+    # Honor the client's apply_markdown (stock Zulip default: true). The client
+    # JSON-encodes the bool, so it arrives as the literal string "true"/"false".
+    # When false, messages_for_ids returns raw Markdown source with
+    # content_type 'text/x-markdown' instead of rendered HTML.
+    apply_markdown = request.GET.get("apply_markdown", "true").lower() != "false"
+
     # Check for narrow parameter (DM queries)
     narrow_str = request.GET.get("narrow")
     stream_id_str = request.GET.get("stream_id")
@@ -581,7 +587,7 @@ def list_messages(request: HttpRequest) -> HttpResponse:
             message_ids=message_ids,
             user_message_flags={mid: [] for mid in message_ids},
             search_fields={},
-            apply_markdown=True,
+            apply_markdown=apply_markdown,
             client_gravatar=False,
             allow_empty_topic_name=False,
             message_edit_history_visibility_policy=1,  # UserProfile.POLICY_ALLOW_ANYONE
@@ -894,6 +900,10 @@ def get_message(request: HttpRequest, message_id: int) -> HttpResponse:
         {
             "result": "success",
             "message": serializer.model_dump(),
+            # Stock-Zulip parity: expose the raw Markdown source at the top level
+            # (the deprecated-but-supported `raw_content` field). Clients that
+            # need the source to re-send a message (e.g. forward) read this.
+            "raw_content": message.content,
         }
     )
 
