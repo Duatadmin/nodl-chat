@@ -14,7 +14,6 @@ from contextlib import suppress
 from functools import wraps
 from typing import Any
 
-from django.db import transaction
 from django.http import HttpRequest, HttpResponse, JsonResponse
 from django.views.decorators.csrf import csrf_exempt
 from pydantic import ValidationError
@@ -22,27 +21,21 @@ from pydantic import ValidationError
 from nodl.api.serializers.messages import (
     MessageCreatePayload,
     MessageSerializer,
-    MessageUpdatePayload,
     ReactionSerializer,
 )
 from nodl.extensions.models import NodlRealmUserExtension, NodlTaskStreamExtension
-from zerver.actions.message_delete import do_delete_messages
-from zerver.actions.message_edit import do_update_message
 from zerver.actions.message_flags import do_update_message_flags
 from zerver.actions.message_send import check_send_message
 from zerver.actions.muted_users import do_mute_user, do_unmute_user
 from zerver.lib.exceptions import JsonableError, RateLimitedError
-from zerver.lib.markdown import render_message_markdown
-from zerver.lib.mention import MentionBackend, MentionData
 from zerver.lib.message import access_message, get_recent_private_conversations, messages_for_ids
 from zerver.lib.muted_users import get_mute_object
 from zerver.lib.rate_limiter import RateLimitedObject, RedisRateLimiterBackend
+from zerver.lib.response import json_response_from_error
 from zerver.lib.streams import access_stream_by_id
-from zerver.lib.types import StreamMessageEditRequest
 from zerver.lib.users import access_user_by_id_including_cross_realm
 from zerver.models import Message, MutedUser, Reaction, Subscription, UserMessage, UserProfile
 from zerver.models.clients import get_client
-from zerver.models.streams import get_stream_by_id_in_realm
 
 logger = logging.getLogger(__name__)
 
@@ -908,24 +901,75 @@ def get_message(request: HttpRequest, message_id: int) -> HttpResponse:
     )
 
 
+def _seed_zulip_request_notes(request: HttpRequest) -> None:
+    """Prepare RequestNotes for delegating to a stock Zulip view.
+
+    JWT/Basic-authed nodl requests bypass Zulip's rest_dispatch, so the notes
+    upstream views rely on (client, log_data) may be unset.
+    """
+    from zerver.lib.request import RequestNotes
+
+    notes = RequestNotes.get_notes(request)
+    if notes.client is None:
+        notes.client = get_client("nodl-api")
+    if notes.log_data is None:
+        notes.log_data = {}
+
+
+# Params update_message_backend accepts; JSON bodies are re-encoded into
+# request.POST under these keys for @typed_endpoint.
+_EDIT_MESSAGE_PARAMS = (
+    "content",
+    "topic",
+    "propagate_mode",
+    "prev_content_sha256",
+    "send_notification_to_old_thread",
+    "send_notification_to_new_thread",
+    "stream_id",
+)
+
+
+@csrf_exempt
+def message_detail_dispatch(request: HttpRequest, message_id: int) -> HttpResponse:
+    """Dispatch /api/v1/messages/{id} by method: GET → fetch, PATCH → edit, DELETE → delete.
+
+    This URL shadows Zulip's rest_path (nodl patterns register first), so
+    every verb the Flutter client uses on it must be served here — before
+    this dispatcher existed, PATCH/DELETE got a 405 from the GET-only view
+    and mobile edit/delete could never reach the backend.
+    """
+    if request.method == "GET":
+        return get_message(request, message_id)
+    elif request.method == "PATCH":
+        return edit_message(request, message_id)
+    elif request.method == "DELETE":
+        return delete_message(request, message_id)
+    return JsonResponse(
+        {"result": "error", "code": "METHOD_NOT_ALLOWED", "msg": "GET, PATCH or DELETE required"},
+        status=405,
+    )
+
+
 @csrf_exempt
 @require_jwt_auth
 @rate_limit(key_prefix="messages_write", limit=MESSAGES_WRITE_LIMIT)
 def edit_message(request: HttpRequest, message_id: int) -> HttpResponse:
-    """Edit a message (owner only).
+    """Edit a message — thin wrapper over Zulip's update_message_backend.
 
-    PATCH /api/v1/messages/{id}
+    PATCH /api/v1/messages/{id}        (canonical; Flutter client, form-encoded)
+    PATCH /api/v1/messages/{id}/edit   (legacy; web client, JSON {"content"})
 
-    Request body:
-    {
-        "content": "Updated content"
-    }
+    Same delegation idiom as update_flags: seed RequestNotes, normalize the
+    body into request.POST for @typed_endpoint, delegate. This inherits ALL
+    stock edit rules — sender-only editing, realm allow_message_editing, the
+    realm edit time limit (+20s grace), prev_content_sha256 conflict
+    detection, edit-history recording — and fixes DM editing: the previous
+    hand-rolled StreamMessageEditRequest assumed a stream recipient and
+    404'd on every direct message.
 
-    Response:
-    {
-        "result": "success",
-        "message": {...}
-    }
+    The legacy /edit path responds with {"message": {...}} (the web client
+    updates its caches from it); the canonical path returns Zulip's own
+    response shape.
     """
     if request.method != "PATCH":
         return JsonResponse(
@@ -934,91 +978,34 @@ def edit_message(request: HttpRequest, message_id: int) -> HttpResponse:
         )
 
     user: UserProfile = request.user_profile  # type: ignore[attr-defined]
+    _seed_zulip_request_notes(request)
 
-    try:
-        body = json.loads(request.body)
-        payload = MessageUpdatePayload(**body)
-    except json.JSONDecodeError:
-        return JsonResponse(
-            {"result": "error", "code": "INVALID_JSON", "msg": "Invalid JSON body"},
-            status=400,
-        )
-    except ValidationError as e:
-        return JsonResponse(
-            {"result": "error", "code": "VALIDATION_ERROR", "msg": str(e)},
-            status=400,
-        )
-
-    # Access the message with lock for modification
-    try:
-        with transaction.atomic():
-            message = access_message(user, message_id, lock_message=True, is_modifying_message=True)
-
-            # Check if user is the message owner
-            if message.sender_id != user.id:
-                return JsonResponse(
-                    {
-                        "result": "error",
-                        "code": "FORBIDDEN",
-                        "msg": "Only the message author can edit",
-                    },
-                    status=403,
+    # JSON bodies (web client) are injected into request.POST; form-encoded
+    # bodies (Flutter client) are parsed by process_as_post below, exactly as
+    # Zulip's rest_dispatch does for PATCH.
+    if request.content_type == "application/json" and request.body:
+        try:
+            body = json.loads(request.body)
+        except json.JSONDecodeError:
+            return JsonResponse(
+                {"result": "error", "code": "INVALID_JSON", "msg": "Invalid JSON body"},
+                status=400,
+            )
+        request.POST = request.POST.copy()
+        for key in _EDIT_MESSAGE_PARAMS:
+            if key in body and key not in request.POST:
+                val = body[key]
+                request.POST[key] = (
+                    json.dumps(val) if isinstance(val, list | dict | bool) else str(val)
                 )
 
-            # Render the new content
-            rendering_result = render_message_markdown(
-                message=message,
-                content=payload.content,
-                realm=user.realm,
-            )
+    from zerver.decorator import process_as_post
+    from zerver.views.message_edit import update_message_backend
 
-            # Get the stream for this message
-            stream = get_stream_by_id_in_realm(message.recipient.type_id, user.realm)
-
-            # Create edit request (content-only edit)
-            edit_request = StreamMessageEditRequest(
-                is_content_edited=True,
-                is_topic_edited=False,
-                is_stream_edited=False,
-                is_message_moved=False,
-                topic_resolved=False,
-                topic_unresolved=False,
-                content=payload.content,
-                target_topic_name=message.topic_name(),
-                target_stream=stream,
-                orig_content=message.content,
-                orig_topic_name=message.topic_name(),
-                orig_stream=stream,
-                propagate_mode="change_one",
-            )
-
-            # Get prior mention user IDs (for notification handling)
-            prior_mention_user_ids: set[int] = set()
-
-            # Create mention data for content editing
-            mention_backend = MentionBackend(user.realm_id)
-            mention_data = MentionData(mention_backend, payload.content, user)
-
-            # Perform the update
-            do_update_message(
-                user_profile=user,
-                target_message=message,
-                message_edit_request=edit_request,
-                send_notification_to_old_thread=False,
-                send_notification_to_new_thread=False,
-                rendering_result=rendering_result,
-                prior_mention_user_ids=prior_mention_user_ids,
-                mention_data=mention_data,
-            )
-
-            # Refresh message from DB
-            message.refresh_from_db()
-
+    try:
+        response = process_as_post(update_message_backend)(request, user, message_id=message_id)
     except JsonableError as e:
-        return JsonResponse(
-            {"result": "error", "code": "NOT_FOUND", "msg": str(e)},
-            status=404,
-        )
+        return json_response_from_error(e)
     except Exception as e:
         logger.exception("Failed to edit message")
         return JsonResponse(
@@ -1026,32 +1013,32 @@ def edit_message(request: HttpRequest, message_id: int) -> HttpResponse:
             status=500,
         )
 
-    # Return updated message
-    reactions = _get_reactions_for_message(message_id)
-    flags = _get_message_flags(user, message_id)
-    serializer = MessageSerializer.from_message(message, reactions=reactions, flags=flags)
+    if request.path.endswith("/edit"):
+        # Legacy web contract: return the updated message object.
+        message = access_message(user, message_id, is_modifying_message=False)
+        reactions = _get_reactions_for_message(message_id)
+        flags = _get_message_flags(user, message_id)
+        serializer = MessageSerializer.from_message(message, reactions=reactions, flags=flags)
+        return JsonResponse({"result": "success", "message": serializer.model_dump()})
 
-    return JsonResponse(
-        {
-            "result": "success",
-            "message": serializer.model_dump(),
-        }
-    )
+    return response
 
 
 @csrf_exempt
 @require_jwt_auth
 @rate_limit(key_prefix="messages_write", limit=MESSAGES_WRITE_LIMIT)
 def delete_message(request: HttpRequest, message_id: int) -> HttpResponse:
-    """Delete a message (owner or admin only).
+    """Delete a message — thin wrapper over Zulip's delete_message_backend.
 
-    DELETE /api/v1/messages/{id}
+    DELETE /api/v1/messages/{id}          (canonical; Flutter client)
+    DELETE /api/v1/messages/{id}/delete   (legacy; web client)
 
-    Response:
-    {
-        "result": "success",
-        "msg": "Message deleted"
-    }
+    Inherits the stock permission rules (can_delete_any/own_message groups,
+    channel-level overrides, realm delete time limit) and stock semantics:
+    the message is archived (soft delete — restorable via `manage.py
+    restore_messages`), never hard-deleted, and the row lock serializes a
+    concurrent edit against the delete. Replaces a hand-rolled
+    owner-or-admin check that ignored every realm setting.
     """
     if request.method != "DELETE":
         return JsonResponse(
@@ -1060,39 +1047,14 @@ def delete_message(request: HttpRequest, message_id: int) -> HttpResponse:
         )
 
     user: UserProfile = request.user_profile  # type: ignore[attr-defined]
+    _seed_zulip_request_notes(request)
 
-    # Access the message
+    from zerver.views.message_edit import delete_message_backend
+
     try:
-        message = access_message(user, message_id, is_modifying_message=True)
-    except JsonableError:
-        return JsonResponse(
-            {"result": "error", "code": "NOT_FOUND", "msg": "Message not found or access denied"},
-            status=404,
-        )
-
-    # Check if user is owner or admin
-    is_owner = message.sender_id == user.id
-    is_admin = user.role in [UserProfile.ROLE_REALM_OWNER, UserProfile.ROLE_REALM_ADMINISTRATOR]
-
-    if not is_owner and not is_admin:
-        return JsonResponse(
-            {
-                "result": "error",
-                "code": "FORBIDDEN",
-                "msg": "Only the author or an admin can delete this message",
-            },
-            status=403,
-        )
-
-    # Delete the message
-    try:
-        do_delete_messages(user.realm, [message], acting_user=user)
-        return JsonResponse(
-            {
-                "result": "success",
-                "msg": "Message deleted",
-            }
-        )
+        return delete_message_backend(request, user, message_id=message_id)
+    except JsonableError as e:
+        return json_response_from_error(e)
     except Exception as e:
         logger.exception("Failed to delete message")
         return JsonResponse(

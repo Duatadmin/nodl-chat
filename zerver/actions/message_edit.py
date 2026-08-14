@@ -1708,6 +1708,31 @@ def check_update_message(
         }
         queue_event_on_commit("embed_links", event_data)
 
+    # NODL MODIFICATION START — mirror of the send-time derived-content block
+    # in message_send.py: a content edit re-renders rendered_content, which
+    # wipes any appended nodl translation block, so re-queue the message as a
+    # translation candidate under the same scope rules (human sender, plain
+    # text, no attachment references). Voice notes are deliberately excluded:
+    # they carry /user_uploads references, and re-transcription on edit would
+    # re-bill AssemblyAI for content that didn't change.
+    if message_edit_request.is_content_edited and rendering_result is not None:
+        from nodl.derived_content import translation_text
+
+        if (
+            not message.sender.is_bot
+            and not rendering_result.potential_attachment_path_ids
+            and translation_text(message.content) is not None
+        ):
+            queue_event_on_commit(
+                "nodl_derived_content",
+                {
+                    "message_id": message.id,
+                    "message_realm_id": user_profile.realm_id,
+                    "path_ids": [],
+                },
+            )
+    # NODL MODIFICATION END
+
     # Update stream active status after we have successfully moved the
     # messages. We only update the new stream here and let the daily
     # cron job handle updating the old stream. User might still want

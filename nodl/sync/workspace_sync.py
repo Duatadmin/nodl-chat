@@ -9,13 +9,21 @@ from django.utils import timezone
 from nodl.extensions.models import NodlRealmExtension, NodlRealmUserExtension, SyncStatus
 from zerver.actions.create_realm import do_create_realm
 from zerver.actions.default_streams import do_add_default_stream
-from zerver.actions.realm_settings import do_deactivate_realm
+from zerver.actions.realm_settings import do_deactivate_realm, do_set_realm_property
 from zerver.actions.streams import bulk_add_subscriptions
 from zerver.actions.users import do_deactivate_user
 from zerver.lib.streams import ensure_stream
 from zerver.models import Realm, Stream, Subscription, UserProfile
 
 logger = logging.getLogger(__name__)
+
+
+# Message edit/delete windows for every nodl realm (WhatsApp model, founder
+# 2026-08-14): edits allowed for 15 minutes, deleting your own message for
+# 60 hours. Admins (can_delete_any_message_group) are exempt from the delete
+# window per stock Zulip semantics. Deletes are always soft (archived).
+REALM_MESSAGE_CONTENT_EDIT_LIMIT_SECONDS = 15 * 60
+REALM_MESSAGE_CONTENT_DELETE_LIMIT_SECONDS = 60 * 60 * 60
 
 
 @dataclass
@@ -149,6 +157,20 @@ class WorkspaceSyncService:
             description=request.description,
             org_type=Realm.ORG_TYPES["business"]["id"],
             create_zulip_discussion_channel=False,
+        )
+
+        # nodl-wide edit/delete windows (Zulip's defaults are 600s for both).
+        do_set_realm_property(
+            realm,
+            "message_content_edit_limit_seconds",
+            REALM_MESSAGE_CONTENT_EDIT_LIMIT_SECONDS,
+            acting_user=None,
+        )
+        do_set_realm_property(
+            realm,
+            "message_content_delete_limit_seconds",
+            REALM_MESSAGE_CONTENT_DELETE_LIMIT_SECONDS,
+            acting_user=None,
         )
 
         logger.info(

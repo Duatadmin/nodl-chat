@@ -18,10 +18,10 @@ from nodl.api.views.events import (
 from nodl.api.views.messages import (
     delete_message,
     edit_message,
-    get_message,
     get_unread_counts,
     list_dm_conversations,
     mark_messages_as_read,
+    message_detail_dispatch,
     messages_dispatch,
     mute_dm_user,
     send_message,
@@ -133,7 +133,11 @@ urlpatterns = [
     # Message REST API endpoints - authenticated via JWT
     path("api/v1/messages", messages_dispatch, name="nodl_messages"),
     path("api/v1/messages/send", send_message, name="nodl_send_message"),
-    path("api/v1/messages/<int:message_id>", get_message, name="nodl_get_message"),
+    # GET/PATCH/DELETE on the canonical Zulip URL (this pattern shadows
+    # Zulip's rest_path, so all three verbs must be served here — the Flutter
+    # client edits/deletes via PATCH/DELETE on this exact path).
+    path("api/v1/messages/<int:message_id>", message_detail_dispatch, name="nodl_message_detail"),
+    # Legacy web-client aliases; same delegating views as above.
     path("api/v1/messages/<int:message_id>/edit", edit_message, name="nodl_edit_message"),
     path("api/v1/messages/<int:message_id>/delete", delete_message, name="nodl_delete_message"),
     # Reactions: Handled by Zulip's native rest_dispatch (POST/DELETE on same URL).

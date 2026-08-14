@@ -142,7 +142,13 @@ def run_archiving(
     while True:
         start_time = time.time()
         with transaction.atomic(savepoint=False):
-            archive_transaction = ArchiveTransaction.objects.create(type=type, realm=realm)
+            # NODL MODIFICATION: MANUAL transactions are user-initiated
+            # deletes; protect them so clean_archived_data can never vacuum
+            # them — user deletes stay restorable forever (soft delete by
+            # design, not by the accident of no cron running).
+            archive_transaction = ArchiveTransaction.objects.create(
+                type=type, realm=realm, protect_from_deletion=(type == ArchiveTransaction.MANUAL)
+            )
             new_chunk = move_rows(
                 Message,
                 query,
