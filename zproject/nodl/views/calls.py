@@ -1,6 +1,8 @@
 import json
 import logging
+import threading
 import uuid
+from datetime import timedelta
 from functools import wraps
 from typing import Any
 
@@ -20,16 +22,103 @@ from zproject.nodl.serializers.call_serializers import (
 from zproject.nodl.services.call_push_service import (
     _ensure_firebase_initialized,
     _parse_firebase_json,
-    dispatch_call_push_async,
+    dispatch_call_event_push_async,
+    dispatch_call_push,
 )
 from zproject.nodl.views.webhooks_livekit import insert_call_event_message
 from zproject.nodl.services.livekit_service import (
+    CALL_ROOM_EMPTY_TIMEOUT,
+    CALL_ROOM_MAX_PARTICIPANTS,
     LIVEKIT_URL,
     create_room_sync,
     generate_token,
 )
 
 logger = logging.getLogger(__name__)
+
+# A ringing call older than this is treated as dead (client crashed or lost
+# network before cancelling) — it must not keep either party "busy" forever.
+# Slightly above the 30s client ring timeout + the 35s room empty_timeout.
+STALE_RINGING_WINDOW = timedelta(seconds=45)
+
+# Backstop for connected calls whose /end and LiveKit webhooks were BOTH
+# lost (e.g. the room was never actually joined). Generous on purpose — the
+# webhook path is the real cleanup; this only prevents a permanently-stuck
+# "busy" state.
+STALE_CONNECTED_WINDOW = timedelta(hours=24)
+
+
+def _expire_stale_calls(profile_ids: list[int]) -> None:
+    """Lazily expire dead call records involving any of the given users.
+
+    Runs inside initiate_call before the busy check, so a stuck record from a
+    crashed client can never permanently block new calls.
+    """
+    now = timezone.now()
+    involved = Q(caller_id__in=profile_ids) | Q(callee_id__in=profile_ids)
+    CallRecord.objects.filter(
+        involved,
+        status="ringing",
+        initiated_at__lt=now - STALE_RINGING_WINDOW,
+    ).update(status="missed", ended_at=now, end_reason="timeout")
+    CallRecord.objects.filter(
+        involved,
+        status="connected",
+        answered_at__lt=now - STALE_CONNECTED_WINDOW,
+    ).update(status="ended", ended_at=now, end_reason="error")
+
+
+def _run_call_setup(
+    callee_id: int,
+    call_id: str,
+    room_name: str,
+    caller_name: str,
+    caller_avatar_url: str,
+) -> None:
+    """Background half of call initiation: provision the LiveKit room, then
+    push-notify the callee's devices.
+
+    Room creation is off the request's critical path (it costs a cross-region
+    admin API round trip). The access tokens embed the same room config, so if
+    the caller's join wins the race and auto-creates the room, the call
+    semantics (empty_timeout, max_participants) still apply and this create
+    just returns the existing room.
+    """
+    try:
+        create_room_sync(
+            room_name,
+            max_participants=CALL_ROOM_MAX_PARTICIPANTS,
+            empty_timeout=CALL_ROOM_EMPTY_TIMEOUT,
+        )
+    except Exception as e:
+        # Non-fatal: token-embedded room config lets the first join
+        # auto-create the room with the right shape.
+        logger.error("LiveKit room creation failed for call %s: %s", call_id, e)
+
+    dispatch_call_push(
+        callee_id=callee_id,
+        call_id=call_id,
+        room_name=room_name,
+        caller_name=caller_name,
+        caller_avatar_url=caller_avatar_url,
+    )
+
+
+def _start_call_setup_async(
+    callee_id: int,
+    call_id: str,
+    room_name: str,
+    caller_name: str,
+    caller_avatar_url: str,
+) -> None:
+    """Fire-and-forget wrapper: spawns _run_call_setup in a daemon thread."""
+    thread = threading.Thread(
+        target=_run_call_setup,
+        args=(callee_id, call_id, room_name, caller_name, caller_avatar_url),
+        daemon=True,
+    )
+    thread.start()
+    logger.debug("Call setup thread started for call %s", call_id)
 
 
 @csrf_exempt
@@ -146,18 +235,37 @@ def initiate_call(request: HttpRequest, user_profile: UserProfile) -> HttpRespon
             status=400,
         )
 
-    # Create room name, provision LiveKit room, generate token
+    # Busy handling: one active call per HUMAN (across sibling workspace
+    # profiles — the device fan-out already treats them as one person).
+    # Dead records must never block calls, so expire stale ones first.
+    from nodl.extensions.mapping import resolve_human_profile_ids
+
+    caller_profile_ids = resolve_human_profile_ids(user_profile.id)
+    callee_profile_ids = resolve_human_profile_ids(callee.id)
+    _expire_stale_calls(list({*caller_profile_ids, *callee_profile_ids}))
+
+    def _has_active_call(profile_ids: list[int]) -> bool:
+        return CallRecord.objects.filter(
+            Q(caller_id__in=profile_ids) | Q(callee_id__in=profile_ids),
+            status__in=("ringing", "connected"),
+        ).exists()
+
+    if _has_active_call(caller_profile_ids):
+        return JsonResponse(
+            {"result": "error", "msg": "You are already in a call", "code": "CALLER_BUSY"},
+            status=409,
+        )
+    if _has_active_call(callee_profile_ids):
+        return JsonResponse(
+            {"result": "error", "msg": "User is on another call", "code": "CALLEE_BUSY"},
+            status=409,
+        )
+
+    # Generate the caller's token now (local JWT signing — cheap); the LiveKit
+    # room itself is provisioned in the background thread below, off the
+    # response's critical path.
     room_name = f"call-{uuid.uuid4()}"
     caller_identity = str(user_profile.id)
-
-    try:
-        create_room_sync(room_name, max_participants=2, empty_timeout=35)
-    except Exception as e:
-        logger.error("LiveKit room creation failed: %s", e)
-        return JsonResponse(
-            {"result": "error", "msg": "Call service unavailable", "code": "SERVICE_ERROR"},
-            status=503,
-        )
 
     try:
         token = generate_token(caller_identity, room_name)
@@ -175,10 +283,11 @@ def initiate_call(request: HttpRequest, user_profile: UserProfile) -> HttpRespon
         status="ringing",
     )
 
-    # Fire-and-forget push dispatch to callee's devices (Story 11.3)
+    # Background: provision the LiveKit room, then push-notify the callee's
+    # devices (Story 11.3).
     caller_name = user_profile.full_name or user_profile.delivery_email
     caller_avatar_url = ""
-    dispatch_call_push_async(
+    _start_call_setup_async(
         callee_id=callee.id,
         call_id=str(call.id),
         room_name=room_name,
@@ -327,6 +436,10 @@ def decline_call(
         call.end_reason = "callee_declined"
         call.save(update_fields=["status", "ended_at", "end_reason"])
 
+    # Tell the caller's devices immediately — without this the caller rings
+    # the full 30s timeout with no idea the callee declined.
+    dispatch_call_event_push_async(call.caller_id, "call_declined", str(call.id))
+
     # Insert DM event message (best-effort — never break the success response)
     try:
         caller = UserProfile.objects.get(id=call.caller_id)
@@ -391,6 +504,10 @@ def cancel_call(
         call.ended_at = timezone.now()
         call.end_reason = "caller_cancelled"
         call.save(update_fields=["status", "ended_at", "end_reason"])
+
+    # Dismiss the callee's ringing UI immediately — without this their phone
+    # keeps ringing for a call that no longer exists ("ghost ringing").
+    dispatch_call_event_push_async(call.callee_id, "call_cancelled", str(call.id))
 
     # Insert DM event message (best-effort — never break the success response)
     try:
@@ -473,6 +590,13 @@ def end_call(
         call.duration_seconds = duration
         call.end_reason = end_reason
         call.save(update_fields=["status", "ended_at", "duration_seconds", "end_reason"])
+
+    # Backstop signal to the other party (LiveKit participant-left events are
+    # the primary in-call path, but they miss e.g. never-joined edge cases).
+    other_party_id = (
+        call.callee_id if call.caller_id == user_profile.id else call.caller_id
+    )
+    dispatch_call_event_push_async(other_party_id, "call_ended", str(call.id))
 
     return JsonResponse({"result": "success", "msg": ""})
 

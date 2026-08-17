@@ -13,6 +13,14 @@ LIVEKIT_API_SECRET = os.environ.get("LIVEKIT_API_SECRET", "")
 
 TOKEN_TTL = datetime.timedelta(hours=1)
 
+# 1-to-1 voice call room shape. Also embedded in every access token so that
+# if a participant's join auto-creates the room (create_room runs off the
+# request path, so a fast client can win the race), the room still gets the
+# call semantics — in particular the 35s empty_timeout that drives the
+# room_finished → missed-call webhook.
+CALL_ROOM_MAX_PARTICIPANTS = 2
+CALL_ROOM_EMPTY_TIMEOUT = 35
+
 
 def generate_token(identity: str, room_name: str) -> str:
     """Generate a LiveKit access token for the given identity and room.
@@ -38,6 +46,12 @@ def generate_token(identity: str, room_name: str) -> str:
             api.VideoGrants(
                 room_join=True,
                 room=room_name,
+            )
+        )
+        .with_room_config(
+            api.RoomConfiguration(
+                max_participants=CALL_ROOM_MAX_PARTICIPANTS,
+                empty_timeout=CALL_ROOM_EMPTY_TIMEOUT,
             )
         )
     )

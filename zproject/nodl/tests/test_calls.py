@@ -155,6 +155,14 @@ class CallViewsTest(ZulipTestCase):
         super().setUp()
         self.caller = self.example_user("hamlet")
         self.callee = self.example_user("othello")
+        # The views fire background threads for room provisioning + push
+        # dispatch; real threads must not run against the test transaction.
+        setup_patcher = patch("zproject.nodl.views.calls._start_call_setup_async")
+        self.mock_call_setup = setup_patcher.start()
+        self.addCleanup(setup_patcher.stop)
+        event_patcher = patch("zproject.nodl.views.calls.dispatch_call_event_push_async")
+        self.mock_event_push = event_patcher.start()
+        self.addCleanup(event_patcher.stop)
 
     def _auth_headers(self, user: UserProfile | None = None) -> dict[str, str]:
         u = user or self.caller
@@ -192,10 +200,7 @@ class CallViewsTest(ZulipTestCase):
         "zproject.nodl.services.livekit_service.LIVEKIT_API_SECRET",
         MOCK_LIVEKIT_ENV["LIVEKIT_API_SECRET"],
     )
-    @patch("zproject.nodl.views.calls.create_room_sync")
-    def test_happy_path_initiate_accept_end(self, mock_create_room: MagicMock) -> None:
-        mock_create_room.return_value = {"name": "call-mock", "sid": "RM_test"}
-
+    def test_happy_path_initiate_accept_end(self) -> None:
         # Initiate
         result = self.client_post(
             "/nodl/calls/initiate",
@@ -211,8 +216,14 @@ class CallViewsTest(ZulipTestCase):
         self.assertIn("livekit_url", data)
         self.assertIn("token", data)
 
-        # Verify create_room_sync was called with correct args
-        mock_create_room.assert_called_once_with(ANY, max_participants=2, empty_timeout=35)
+        # Room provisioning + callee push run off the critical path.
+        self.mock_call_setup.assert_called_once_with(
+            callee_id=self.callee.id,
+            call_id=data["call_id"],
+            room_name=data["room_name"],
+            caller_name=ANY,
+            caller_avatar_url="",
+        )
 
         call_id = data["call_id"]
 
@@ -740,3 +751,231 @@ class CallViewsTest(ZulipTestCase):
         )
         self.assertEqual(result.status_code, 400)
         self.assertIn("integer", result.json()["msg"])
+
+
+class CallBusyAndSignalingTest(ZulipTestCase):
+    """Busy rejection, stale-call self-healing, and lifecycle event pushes."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.caller = self.example_user("hamlet")
+        self.callee = self.example_user("othello")
+        self.third = self.example_user("cordelia")
+        setup_patcher = patch("zproject.nodl.views.calls._start_call_setup_async")
+        self.mock_call_setup = setup_patcher.start()
+        self.addCleanup(setup_patcher.stop)
+        event_patcher = patch("zproject.nodl.views.calls.dispatch_call_event_push_async")
+        self.mock_event_push = event_patcher.start()
+        self.addCleanup(event_patcher.stop)
+
+    def _auth_headers(self, user: UserProfile) -> dict[str, str]:
+        cred = base64.b64encode(f"{user.delivery_email}:{user.api_key}".encode()).decode()
+        return {"HTTP_AUTHORIZATION": f"Basic {cred}"}
+
+    def _initiate(self, caller: UserProfile, callee: UserProfile):
+        return self.client_post(
+            "/nodl/calls/initiate",
+            json.dumps({"callee_id": callee.id}),
+            content_type="application/json",
+            **self._auth_headers(caller),
+        )
+
+    # === Busy handling ===
+
+    def test_initiate_caller_busy(self) -> None:
+        CallRecord.objects.create(
+            room_name="call-busy-caller",
+            caller=self.caller,
+            callee=self.third,
+            status="connected",
+            answered_at=timezone.now(),
+        )
+        result = self._initiate(self.caller, self.callee)
+        self.assertEqual(result.status_code, 409)
+        self.assertEqual(result.json()["code"], "CALLER_BUSY")
+        self.mock_call_setup.assert_not_called()
+
+    def test_initiate_callee_busy(self) -> None:
+        CallRecord.objects.create(
+            room_name="call-busy-callee",
+            caller=self.third,
+            callee=self.callee,
+            status="ringing",
+        )
+        result = self._initiate(self.caller, self.callee)
+        self.assertEqual(result.status_code, 409)
+        self.assertEqual(result.json()["code"], "CALLEE_BUSY")
+        self.mock_call_setup.assert_not_called()
+
+    def test_initiate_callee_busy_as_caller_elsewhere(self) -> None:
+        """Callee who is themselves ringing someone else counts as busy."""
+        CallRecord.objects.create(
+            room_name="call-busy-callee-outgoing",
+            caller=self.callee,
+            callee=self.third,
+            status="ringing",
+        )
+        result = self._initiate(self.caller, self.callee)
+        self.assertEqual(result.status_code, 409)
+        self.assertEqual(result.json()["code"], "CALLEE_BUSY")
+
+    # === Stale-call self-healing ===
+
+    def test_stale_ringing_call_does_not_block(self) -> None:
+        """A ringing record from a crashed client expires instead of blocking."""
+        stale = CallRecord.objects.create(
+            room_name="call-stale-ringing",
+            caller=self.third,
+            callee=self.callee,
+            status="ringing",
+        )
+        CallRecord.objects.filter(id=stale.id).update(
+            initiated_at=timezone.now() - timezone.timedelta(minutes=2),
+        )
+
+        result = self._initiate(self.caller, self.callee)
+        self.assertEqual(result.status_code, 200)
+
+        stale.refresh_from_db()
+        self.assertEqual(stale.status, "missed")
+        self.assertEqual(stale.end_reason, "timeout")
+        self.assertIsNotNone(stale.ended_at)
+
+    def test_fresh_ringing_call_still_blocks(self) -> None:
+        CallRecord.objects.create(
+            room_name="call-fresh-ringing",
+            caller=self.third,
+            callee=self.callee,
+            status="ringing",
+        )
+        result = self._initiate(self.caller, self.callee)
+        self.assertEqual(result.status_code, 409)
+
+    def test_stale_connected_call_does_not_block(self) -> None:
+        stale = CallRecord.objects.create(
+            room_name="call-stale-connected",
+            caller=self.caller,
+            callee=self.third,
+            status="connected",
+            answered_at=timezone.now() - timezone.timedelta(days=2),
+        )
+        result = self._initiate(self.caller, self.callee)
+        self.assertEqual(result.status_code, 200)
+
+        stale.refresh_from_db()
+        self.assertEqual(stale.status, "ended")
+        self.assertEqual(stale.end_reason, "error")
+
+    # === Lifecycle event pushes ===
+
+    def _create_ringing_call(self) -> CallRecord:
+        return CallRecord.objects.create(
+            room_name=f"call-{uuid.uuid4()}",
+            caller=self.caller,
+            callee=self.callee,
+            status="ringing",
+        )
+
+    def test_cancel_pushes_call_cancelled_to_callee(self) -> None:
+        call = self._create_ringing_call()
+        result = self.client_post(
+            f"/nodl/calls/{call.id}/cancel",
+            content_type="application/json",
+            **self._auth_headers(self.caller),
+        )
+        self.assertEqual(result.status_code, 200)
+        self.mock_event_push.assert_called_once_with(
+            self.callee.id, "call_cancelled", str(call.id))
+
+    def test_decline_pushes_call_declined_to_caller(self) -> None:
+        call = self._create_ringing_call()
+        result = self.client_post(
+            f"/nodl/calls/{call.id}/decline",
+            content_type="application/json",
+            **self._auth_headers(self.callee),
+        )
+        self.assertEqual(result.status_code, 200)
+        self.mock_event_push.assert_called_once_with(
+            self.caller.id, "call_declined", str(call.id))
+
+    def test_end_pushes_call_ended_to_other_party(self) -> None:
+        call = CallRecord.objects.create(
+            room_name=f"call-{uuid.uuid4()}",
+            caller=self.caller,
+            callee=self.callee,
+            status="connected",
+            answered_at=timezone.now(),
+        )
+        result = self.client_post(
+            f"/nodl/calls/{call.id}/end",
+            content_type="application/json",
+            **self._auth_headers(self.caller),
+        )
+        self.assertEqual(result.status_code, 200)
+        self.mock_event_push.assert_called_once_with(
+            self.callee.id, "call_ended", str(call.id))
+
+    def test_failed_cancel_no_event_push(self) -> None:
+        """A 409 cancel (wrong state) must not push a dismissal."""
+        call = CallRecord.objects.create(
+            room_name=f"call-{uuid.uuid4()}",
+            caller=self.caller,
+            callee=self.callee,
+            status="connected",
+            answered_at=timezone.now(),
+        )
+        result = self.client_post(
+            f"/nodl/calls/{call.id}/cancel",
+            content_type="application/json",
+            **self._auth_headers(self.caller),
+        )
+        self.assertEqual(result.status_code, 409)
+        self.mock_event_push.assert_not_called()
+
+
+class RunCallSetupTest(TestCase):
+    """Unit tests for the background call-setup worker."""
+
+    @patch("zproject.nodl.views.calls.dispatch_call_push")
+    @patch("zproject.nodl.views.calls.create_room_sync")
+    def test_creates_room_then_dispatches_push(
+        self, mock_create_room: MagicMock, mock_push: MagicMock
+    ) -> None:
+        from zproject.nodl.views.calls import _run_call_setup
+
+        mock_create_room.return_value = {"name": "call-x", "sid": "RM_x"}
+        _run_call_setup(
+            callee_id=7,
+            call_id="call-id-1",
+            room_name="call-x",
+            caller_name="Hamlet",
+            caller_avatar_url="",
+        )
+        mock_create_room.assert_called_once_with(
+            "call-x", max_participants=2, empty_timeout=35)
+        mock_push.assert_called_once_with(
+            callee_id=7,
+            call_id="call-id-1",
+            room_name="call-x",
+            caller_name="Hamlet",
+            caller_avatar_url="",
+        )
+
+    @patch("zproject.nodl.views.calls.dispatch_call_push")
+    @patch("zproject.nodl.views.calls.create_room_sync")
+    def test_room_creation_failure_still_pushes(
+        self, mock_create_room: MagicMock, mock_push: MagicMock
+    ) -> None:
+        """Token-embedded room config makes room creation non-fatal — the
+        callee must still be rung."""
+        from zproject.nodl.views.calls import _run_call_setup
+
+        mock_create_room.side_effect = RuntimeError("livekit down")
+        _run_call_setup(
+            callee_id=7,
+            call_id="call-id-2",
+            room_name="call-y",
+            caller_name="Hamlet",
+            caller_avatar_url="",
+        )
+        mock_push.assert_called_once()

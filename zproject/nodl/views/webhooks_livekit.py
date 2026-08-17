@@ -141,6 +141,11 @@ def _handle_room_finished(room_name: str) -> None:
         call.end_reason = "timeout"
         call.save(update_fields=["status", "ended_at", "end_reason"])
 
+    # Dismiss any still-ringing UI on the callee's devices (best-effort).
+    from zproject.nodl.services.call_push_service import dispatch_call_event_push_async
+
+    dispatch_call_event_push_async(call.callee_id, "call_timeout", str(call.id))
+
     # Insert DM message outside transaction (best-effort)
     try:
         caller = UserProfile.objects.get(id=call.caller_id)

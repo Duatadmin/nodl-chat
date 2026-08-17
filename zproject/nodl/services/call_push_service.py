@@ -412,3 +412,127 @@ def dispatch_call_push_async(
     )
     thread.start()
     logger.debug("Push dispatch thread started for call %s", call_id)
+
+
+# ---------- Call lifecycle event pushes (cancel / decline / end / timeout) ----------
+#
+# These are the signaling messages that keep both sides' UIs honest:
+#   call_cancelled — caller hung up while ringing → dismiss callee's ringing UI
+#   call_declined  — callee declined → end caller's outgoing-call UI immediately
+#   call_ended     — one side hung up a connected call → backstop for the
+#                    other side (LiveKit participant events are the primary path)
+#   call_timeout   — server marked the call missed → dismiss stale ringing UI
+#
+# Android only for now: FCM high-priority data messages. iOS VoIP pushes MUST
+# report an incoming call via CallKit on every push (PushKit policy), so event
+# dismissal on iOS needs native CallKit end-call handling — deferred until the
+# iOS bring-up lands.
+
+CALL_EVENT_TYPES = ("call_cancelled", "call_declined", "call_ended", "call_timeout")
+
+
+def send_fcm_call_event(fcm_token: str, event_type: str, call_id: str) -> str:
+    """Send an FCM high-priority DATA message carrying a call lifecycle event.
+
+    Returns "sent" | "unregistered" | "error". Never raises.
+    """
+    if not _ensure_firebase_initialized():
+        logger.warning("Firebase not initialized — skipping FCM call event")
+        return "error"
+
+    try:
+        message = messaging.Message(
+            data={
+                "type": event_type,
+                "call_id": call_id,
+            },
+            token=fcm_token,
+            android=messaging.AndroidConfig(
+                priority="high",
+            ),
+        )
+        response = messaging.send(message)
+        logger.info("FCM %s sent for call %s: %s", event_type, call_id, response)
+        return "sent"
+
+    except (UnregisteredError, NotFoundError) as e:
+        logger.warning("FCM token %s... is unregistered/not-found: %s", fcm_token[:16], e)
+        return "unregistered"
+
+    except Exception as e:
+        logger.error("FCM call event error for token %s...: %s", fcm_token[:16], e)
+        return "error"
+
+
+def dispatch_call_event_push(user_id: int, event_type: str, call_id: str) -> None:
+    """Send a call lifecycle event push to ALL devices of the given HUMAN.
+
+    Same token fan-out as dispatch_call_push (sibling profiles, dedupe by
+    token, PushDeviceToken fallback), but delivery is best-effort per token —
+    an event push is a dismissal signal, not a ring, so we send to every
+    known token rather than stopping at the first success.
+
+    Errors are logged but never raised — designed for a fire-and-forget thread.
+    """
+    from nodl.extensions.mapping import resolve_human_profile_ids
+    from zerver.models import PushDeviceToken
+    from zproject.nodl.models import DeviceVoipToken
+
+    if event_type not in CALL_EVENT_TYPES:
+        logger.error("Unknown call event type %r for call %s", event_type, call_id)
+        return
+
+    try:
+        profile_ids = resolve_human_profile_ids(user_id)
+
+        tokens = list(
+            DeviceVoipToken.objects.filter(
+                user_id__in=profile_ids,
+                is_active=True,
+            ).values("platform", "voip_token", "fcm_token", "device_id")
+        )
+
+        tried_fcm_tokens: set[str] = set()
+
+        for token_record in tokens:
+            platform = token_record["platform"]
+            if platform == "android":
+                fcm_token = token_record.get("fcm_token")
+                if not fcm_token or fcm_token in tried_fcm_tokens:
+                    continue
+                tried_fcm_tokens.add(fcm_token)
+                result = send_fcm_call_event(fcm_token, event_type, call_id)
+                if result == "unregistered":
+                    DeviceVoipToken.objects.filter(
+                        user_id__in=profile_ids, fcm_token=fcm_token,
+                    ).update(is_active=False)
+            # iOS: see module comment — VoIP event pushes deferred until the
+            # native CallKit end-call path exists.
+
+        # Zulip PushDeviceToken fallback — reach devices whose DeviceVoipToken
+        # registration is missing or stale.
+        zulip_fcm_tokens = PushDeviceToken.objects.filter(
+            user_id__in=profile_ids,
+            kind=PushDeviceToken.FCM,
+        ).values_list("token", flat=True)
+        for fallback_token in zulip_fcm_tokens:
+            if fallback_token in tried_fcm_tokens:
+                continue
+            tried_fcm_tokens.add(fallback_token)
+            send_fcm_call_event(fallback_token, event_type, call_id)
+
+    except Exception as e:
+        logger.error(
+            "Call event push (%s) failed for user %s: %s", event_type, user_id, e,
+        )
+
+
+def dispatch_call_event_push_async(user_id: int, event_type: str, call_id: str) -> None:
+    """Fire-and-forget wrapper: spawns dispatch_call_event_push in a daemon thread."""
+    thread = threading.Thread(
+        target=dispatch_call_event_push,
+        args=(user_id, event_type, call_id),
+        daemon=True,
+    )
+    thread.start()
+    logger.debug("Call event push thread started: %s for call %s", event_type, call_id)
