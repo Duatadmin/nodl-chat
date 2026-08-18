@@ -1,20 +1,28 @@
 import logging
 import os
 
-from django.conf import settings
 from django.db import transaction
 from django.http import HttpRequest, HttpResponse, JsonResponse
 from django.utils import timezone
 from django.views.decorators.csrf import csrf_exempt
-
 from livekit.api import TokenVerifier, WebhookReceiver
 
-from zerver.actions.message_send import internal_send_group_direct_message
+from nodl.api.views.card_schemas import build_card_message_content
+from zerver.actions.message_flags import do_update_message_flags
+from zerver.actions.message_send import internal_send_private_message
 from zerver.models import UserProfile
-from zerver.models.users import get_system_bot
 from zproject.nodl.models import CallRecord
 
 logger = logging.getLogger(__name__)
+
+# Human-readable fallback per call-event status — what legacy clients, web,
+# push notifications, and DM-list previews show (the card marker precedes it).
+CALL_EVENT_FALLBACK = {
+    "missed": "📞 Missed voice call",
+    "declined": "📞 Voice call declined",
+    "cancelled": "📞 Missed voice call",
+    "ended": "📞 Voice call",
+}
 
 LIVEKIT_API_KEY = os.environ.get("LIVEKIT_API_KEY", "")
 LIVEKIT_API_SECRET = os.environ.get("LIVEKIT_API_SECRET", "")
@@ -28,24 +36,56 @@ def _get_webhook_receiver() -> WebhookReceiver | None:
     return WebhookReceiver(TokenVerifier(LIVEKIT_API_KEY, LIVEKIT_API_SECRET))
 
 
-def insert_call_event_message(caller: UserProfile, callee: UserProfile, message_text: str) -> None:
-    """Insert a system DM message about a call event into the caller-callee conversation.
+def insert_call_event_message(
+    call: CallRecord,
+    status: str,
+    *,
+    duration_seconds: int | None = None,
+) -> None:
+    """Insert a call-event message into the caller↔callee 1:1 DM thread.
 
-    Uses Zulip's Notification Bot as the sender. The message appears in the
-    DM thread between caller and callee (not in individual bot DMs),
-    persists, and syncs across devices.
+    Sender is the CALLER (the human whose action the event describes) — a bot
+    sender is structurally impossible here: Zulip always adds the sender to
+    the recipient set, so bot + caller + callee would become a separate
+    3-party group DM instead of the existing 1:1 (the pre-2026-08-18 bug that
+    put every call in the chats list as its own conversation).
+
+    Content is a `nodl-card:v1` call_event card plus a human-readable
+    fallback; clients that know the card render a WhatsApp-style call bubble,
+    everything else (web, push text, DM previews) shows the fallback.
+
+    For events the recipient (callee) already experienced first-hand —
+    declining a call, or a normal ended call — the message is marked read for
+    them immediately: no unread badge, no notification. Missed/cancelled
+    calls stay unread for the callee, which is exactly the missed-call badge.
     """
     try:
-        notification_bot = get_system_bot(settings.NOTIFICATION_BOT, caller.realm_id)
-        # Send into the caller↔callee DM thread via group direct message
-        internal_send_group_direct_message(
-            caller.realm,
-            notification_bot,
-            message_text,
-            recipient_users=[caller, callee],
+        caller = UserProfile.objects.get(id=call.caller_id)
+        callee = UserProfile.objects.get(id=call.callee_id)
+        payload: dict[str, object] = {
+            "call_id": str(call.id),
+            "status": status,
+            "caller_id": caller.id,
+            "callee_id": callee.id,
+        }
+        if duration_seconds is not None:
+            payload["duration_seconds"] = duration_seconds
+        content = build_card_message_content(
+            "call_event", payload, CALL_EVENT_FALLBACK[status],
         )
+        quiet_for_callee = status in ("declined", "ended")
+        message_id = internal_send_private_message(
+            caller,
+            callee,
+            content,
+            disable_external_notifications=quiet_for_callee,
+        )
+        if message_id is not None and quiet_for_callee:
+            do_update_message_flags(callee, "add", "read", [message_id])
     except Exception as e:
-        logger.error("Failed to insert call event message: %s", e)
+        logger.error(
+            "Failed to insert call event message for call %s: %s", call.id, e,
+        )
 
 
 @csrf_exempt
@@ -147,12 +187,7 @@ def _handle_room_finished(room_name: str) -> None:
     dispatch_call_event_push_async(call.callee_id, "call_timeout", str(call.id))
 
     # Insert DM message outside transaction (best-effort)
-    try:
-        caller = UserProfile.objects.get(id=call.caller_id)
-        callee = UserProfile.objects.get(id=call.callee_id)
-        insert_call_event_message(caller, callee, "Missed voice call")
-    except Exception as e:
-        logger.error("room_finished: failed to insert DM for call %s: %s", call.id, e)
+    insert_call_event_message(call, "missed")
 
 
 def _handle_participant_joined(room_name: str, event: object) -> None:
@@ -236,5 +271,10 @@ def _handle_participant_left(room_name: str, event: object) -> None:
         call.duration_seconds = duration
         call.end_reason = "room_empty"
         call.save(update_fields=["status", "ended_at", "duration_seconds", "end_reason"])
+
+    # Exactly one path performs the connected→ended transition (the row lock +
+    # status guards above make /end and this webhook mutually exclusive), so
+    # the ended event is posted once per call.
+    insert_call_event_message(call, "ended", duration_seconds=duration)
 
     logger.info("Both participants left room %s — call ended", room_name)

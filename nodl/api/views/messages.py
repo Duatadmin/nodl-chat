@@ -1248,6 +1248,18 @@ def list_dm_conversations(request: HttpRequest) -> HttpResponse:
             if not non_bot_users:
                 continue
 
+            # Skip conversations with ANY bot counterpart — same policy the
+            # mobile client applies to its live layer (hasBotParticipant).
+            # Emitting them with the bots stripped used to leak e.g. a legacy
+            # call-event huddle (caller+callee+Notification Bot) as a
+            # duplicate row wearing the human counterpart's name.
+            if any(
+                profiles_by_id[user_id].get("is_bot")
+                for user_id in participant_ids
+                if user_id in profiles_by_id
+            ):
+                continue
+
             users_data = [
                 {
                     "id": u["id"],

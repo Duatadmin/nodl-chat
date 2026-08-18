@@ -54,9 +54,27 @@ class CheckinCard(BaseModel):
     response: str | None = None
 
 
+class CallEventCard(BaseModel):
+    """Voice-call lifecycle event rendered inline in the caller↔callee DM.
+
+    Posted by the call views/webhooks with the CALLER as the message sender,
+    so it lands in the existing 1:1 thread (a bot sender would force a
+    3-party group DM — see zerver.lib.recipient_users, which always adds the
+    sender to the recipient set). Clients render direction/labels from
+    caller_id vs. the viewing user.
+    """
+
+    call_id: str
+    status: Literal["missed", "declined", "cancelled", "ended"]
+    caller_id: int
+    callee_id: int
+    duration_seconds: int | None = None
+
+
 CARD_SCHEMAS: dict[str, type[BaseModel]] = {
     "ask_ai_answer": AskAiAnswerCard,
     "checkin": CheckinCard,
+    "call_event": CallEventCard,
 }
 
 
@@ -94,6 +112,7 @@ def build_card_message_content(
 
 __all__ = [
     "AskAiAnswerCard",
+    "CallEventCard",
     "CheckinCard",
     "CARD_SCHEMAS",
     "UnknownCardTypeError",

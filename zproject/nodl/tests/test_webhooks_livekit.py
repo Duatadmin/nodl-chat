@@ -28,34 +28,87 @@ class InsertCallEventMessageTest(TestCase):
         assert len(users) >= 2
         self.caller = users[0]
         self.callee = users[1]
-
-    @patch("zproject.nodl.views.webhooks_livekit.internal_send_group_direct_message")
-    @patch("zproject.nodl.views.webhooks_livekit.get_system_bot")
-    def test_sends_dm_into_caller_callee_thread(
-        self, mock_get_bot: MagicMock, mock_send: MagicMock
-    ) -> None:
-        mock_bot = MagicMock()
-        mock_get_bot.return_value = mock_bot
-
-        insert_call_event_message(self.caller, self.callee, "Missed voice call")
-
-        mock_send.assert_called_once_with(
-            self.caller.realm,
-            mock_bot,
-            "Missed voice call",
-            recipient_users=[self.caller, self.callee],
+        self.call = CallRecord.objects.create(
+            room_name=f"call-{uuid.uuid4()}",
+            caller=self.caller,
+            callee=self.callee,
+            status="missed",
         )
 
-    @patch("zproject.nodl.views.webhooks_livekit.internal_send_group_direct_message")
-    @patch("zproject.nodl.views.webhooks_livekit.get_system_bot")
-    def test_exception_does_not_raise(
-        self, mock_get_bot: MagicMock, mock_send: MagicMock
+    @patch("zproject.nodl.views.webhooks_livekit.internal_send_private_message")
+    def test_sends_1to1_dm_from_caller_to_callee(self, mock_send: MagicMock) -> None:
+        """The event lands in the caller↔callee 1:1 — caller as sender, no bot.
+
+        A bot sender is the historical bug: Zulip adds the sender to the
+        recipient set, so bot+caller+callee became a separate 3-party huddle.
+        """
+        mock_send.return_value = 123
+
+        insert_call_event_message(self.call, "missed")
+
+        mock_send.assert_called_once()
+        args, kwargs = mock_send.call_args
+        self.assertEqual(args[0].id, self.caller.id)
+        self.assertEqual(args[1].id, self.callee.id)
+        content = args[2]
+        self.assertIn("nodl-card:v1:", content)
+        self.assertIn("📞 Missed voice call", content)
+        # Missed calls notify the callee (the missed-call push/badge).
+        self.assertFalse(kwargs.get("disable_external_notifications"))
+
+    @patch("zproject.nodl.views.webhooks_livekit.internal_send_private_message")
+    def test_card_payload_roundtrips(self, mock_send: MagicMock) -> None:
+        mock_send.return_value = 123
+
+        insert_call_event_message(self.call, "ended", duration_seconds=42)
+
+        content = mock_send.call_args[0][2]
+        encoded = content.split("nodl-card:v1:")[1].split(" -->")[0]
+        encoded += "=" * (-len(encoded) % 4)
+        envelope = json.loads(base64.urlsafe_b64decode(encoded))
+        self.assertEqual(envelope["card_type"], "call_event")
+        payload = envelope["payload"]
+        self.assertEqual(payload["call_id"], str(self.call.id))
+        self.assertEqual(payload["status"], "ended")
+        self.assertEqual(payload["caller_id"], self.caller.id)
+        self.assertEqual(payload["callee_id"], self.callee.id)
+        self.assertEqual(payload["duration_seconds"], 42)
+
+    @patch("zproject.nodl.views.webhooks_livekit.do_update_message_flags")
+    @patch("zproject.nodl.views.webhooks_livekit.internal_send_private_message")
+    def test_quiet_statuses_marked_read_for_callee(
+        self, mock_send: MagicMock, mock_flags: MagicMock
     ) -> None:
+        """ended/declined: no notification, marked read for the callee."""
+        mock_send.return_value = 456
+
+        insert_call_event_message(self.call, "ended", duration_seconds=5)
+
+        self.assertTrue(
+            mock_send.call_args.kwargs.get("disable_external_notifications"))
+        mock_flags.assert_called_once()
+        flag_args = mock_flags.call_args[0]
+        self.assertEqual(flag_args[0].id, self.callee.id)
+        self.assertEqual(flag_args[1:], ("add", "read", [456]))
+
+    @patch("zproject.nodl.views.webhooks_livekit.do_update_message_flags")
+    @patch("zproject.nodl.views.webhooks_livekit.internal_send_private_message")
+    def test_missed_stays_unread_for_callee(
+        self, mock_send: MagicMock, mock_flags: MagicMock
+    ) -> None:
+        mock_send.return_value = 789
+
+        insert_call_event_message(self.call, "missed")
+
+        mock_flags.assert_not_called()
+
+    @patch("zproject.nodl.views.webhooks_livekit.internal_send_private_message")
+    def test_exception_does_not_raise(self, mock_send: MagicMock) -> None:
         """Errors in message insertion are logged but don't raise."""
-        mock_get_bot.side_effect = Exception("Bot not found")
+        mock_send.side_effect = Exception("send failed")
 
         # Should not raise
-        insert_call_event_message(self.caller, self.callee, "Test")
+        insert_call_event_message(self.call, "missed")
 
 
 # ===== Webhook handler tests =====
@@ -155,7 +208,7 @@ class HandleRoomFinishedTest(TestCase):
         self.assertIsNotNone(call.ended_at)
         self.assertEqual(call.end_reason, "timeout")
         mock_msg.assert_called_once()
-        self.assertIn("Missed voice call", mock_msg.call_args[0][2])
+        self.assertEqual(mock_msg.call_args[0][1], "missed")
 
     @patch("zproject.nodl.views.webhooks_livekit.insert_call_event_message")
     def test_already_ended_call_idempotent(self, mock_msg: MagicMock) -> None:
@@ -282,8 +335,9 @@ class HandleParticipantLeftTest(TestCase):
         event.room.num_participants = num_participants
         return event
 
-    def test_both_left_ends_connected_call(self) -> None:
-        """Both participants left → call ended with duration."""
+    @patch("zproject.nodl.views.webhooks_livekit.insert_call_event_message")
+    def test_both_left_ends_connected_call(self, mock_msg: MagicMock) -> None:
+        """Both participants left → call ended with duration + DM entry."""
         call = CallRecord.objects.create(
             room_name="call-both-left",
             caller=self.caller,
@@ -300,6 +354,12 @@ class HandleParticipantLeftTest(TestCase):
         self.assertIsNotNone(call.ended_at)
         self.assertIsNotNone(call.duration_seconds)
         self.assertEqual(call.end_reason, "room_empty")
+        mock_msg.assert_called_once()
+        self.assertEqual(mock_msg.call_args[0][1], "ended")
+        self.assertEqual(
+            mock_msg.call_args.kwargs.get("duration_seconds"),
+            call.duration_seconds,
+        )
 
     def test_one_still_in_room_no_action(self) -> None:
         """One participant still in room — no action."""
@@ -396,7 +456,8 @@ class CallEventDmMessageTest(ZulipTestCase):
 
         mock_msg.assert_called_once()
         args = mock_msg.call_args[0]
-        self.assertEqual(args[2], "Voice call declined")
+        self.assertEqual(args[0].id, call.id)
+        self.assertEqual(args[1], "declined")
 
     @patch("zproject.nodl.views.calls.insert_call_event_message")
     def test_cancel_inserts_dm_message(self, mock_msg: MagicMock) -> None:
@@ -411,7 +472,41 @@ class CallEventDmMessageTest(ZulipTestCase):
 
         mock_msg.assert_called_once()
         args = mock_msg.call_args[0]
-        self.assertEqual(args[2], "Voice call cancelled")
+        self.assertEqual(args[0].id, call.id)
+        self.assertEqual(args[1], "cancelled")
+
+    @patch("zproject.nodl.views.calls.insert_call_event_message")
+    def test_end_inserts_ended_dm_message_once(self, mock_msg: MagicMock) -> None:
+        """Ending a connected call posts one 'ended' entry with duration;
+        the idempotent second /end must not post another."""
+        call = CallRecord.objects.create(
+            room_name=f"call-{uuid.uuid4()}",
+            caller=self.caller,
+            callee=self.callee,
+            status="connected",
+            answered_at=timezone.now(),
+        )
+
+        result = self.client_post(
+            f"/nodl/calls/{call.id}/end",
+            content_type="application/json",
+            **self._auth_headers(self.caller),
+        )
+        self.assertEqual(result.status_code, 200)
+        mock_msg.assert_called_once()
+        args = mock_msg.call_args[0]
+        self.assertEqual(args[0].id, call.id)
+        self.assertEqual(args[1], "ended")
+        self.assertIsInstance(
+            mock_msg.call_args.kwargs.get("duration_seconds"), int)
+
+        result = self.client_post(
+            f"/nodl/calls/{call.id}/end",
+            content_type="application/json",
+            **self._auth_headers(self.callee),
+        )
+        self.assertEqual(result.status_code, 200)
+        mock_msg.assert_called_once()
 
     @patch("zproject.nodl.views.calls.insert_call_event_message")
     def test_decline_wrong_state_no_message(self, mock_msg: MagicMock) -> None:

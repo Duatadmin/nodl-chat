@@ -441,11 +441,7 @@ def decline_call(
     dispatch_call_event_push_async(call.caller_id, "call_declined", str(call.id))
 
     # Insert DM event message (best-effort — never break the success response)
-    try:
-        caller = UserProfile.objects.get(id=call.caller_id)
-        insert_call_event_message(caller, user_profile, "Voice call declined")
-    except Exception as e:
-        logger.error("decline_call: failed to insert DM for call %s: %s", call.id, e)
+    insert_call_event_message(call, "declined")
 
     return JsonResponse({"result": "success", "msg": ""})
 
@@ -510,11 +506,7 @@ def cancel_call(
     dispatch_call_event_push_async(call.callee_id, "call_cancelled", str(call.id))
 
     # Insert DM event message (best-effort — never break the success response)
-    try:
-        callee = UserProfile.objects.get(id=call.callee_id)
-        insert_call_event_message(user_profile, callee, "Voice call cancelled")
-    except Exception as e:
-        logger.error("cancel_call: failed to insert DM for call %s: %s", call.id, e)
+    insert_call_event_message(call, "cancelled")
 
     return JsonResponse({"result": "success", "msg": ""})
 
@@ -597,6 +589,12 @@ def end_call(
         call.callee_id if call.caller_id == user_profile.id else call.caller_id
     )
     dispatch_call_event_push_async(other_party_id, "call_ended", str(call.id))
+
+    # Insert the ended-call DM entry (WhatsApp/Telegram parity: a completed
+    # call shows in the thread with its duration). Only this request performed
+    # the connected→ended transition (idempotent early-return above), so the
+    # event is posted exactly once even with simultaneous /end + webhook.
+    insert_call_event_message(call, "ended", duration_seconds=duration)
 
     return JsonResponse({"result": "success", "msg": ""})
 
