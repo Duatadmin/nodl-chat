@@ -29,6 +29,25 @@ def default_recipient_kwargs(callee_id: int, workspace_id: str = "") -> dict[str
     }
 
 
+FAKE_PEM = "-----BEGIN PRIVATE KEY-----\nfake-key-material\n-----END PRIVATE KEY-----\n"
+
+
+def apns_config(**overrides: object) -> "patch._patch":
+    """Patch the module-level APNs config constants (read at import time,
+    so os.environ patching does nothing)."""
+    import zproject.nodl.services.call_push_service as cps
+
+    config = {
+        "APNS_KEY_ID": "ABC123DEFG",
+        "APNS_TEAM_ID": "8Z2F9BY77D",
+        "APNS_BUNDLE_ID": "tech.nodle.mobile",
+        "APNS_AUTH_KEY_B64": base64.b64encode(FAKE_PEM.encode()).decode(),
+        "APNS_AUTH_KEY_PATH": "",
+        **overrides,
+    }
+    return patch.multiple(cps, **config)
+
+
 # ===== VoIP Token Endpoint Tests =====
 
 
@@ -631,6 +650,29 @@ class DispatchCallPushFanOutTest(ZulipTestCase):
 
         self.assertEqual(mock_fcm.call_count, 1)
 
+    @patch("zproject.nodl.services.call_push_service.send_apns_call_event")
+    @patch("zproject.nodl.services.call_push_service.send_fcm_call_event")
+    def test_call_event_apns_token_dedupes_across_profiles(
+        self, mock_fcm: MagicMock, mock_apns: MagicMock
+    ) -> None:
+        """One device's APNs token registered under both sibling profiles →
+        exactly one event push."""
+        from zerver.models import PushDeviceToken
+        from zproject.nodl.services.call_push_service import dispatch_call_event_push
+
+        for profile in (self.profile_a, self.profile_b):
+            PushDeviceToken.objects.create(
+                user=profile,
+                kind=PushDeviceToken.APNS,
+                token="apns-token-shared",
+            )
+
+        dispatch_call_event_push(self.profile_a.id, "call_cancelled", self.call_id)
+
+        mock_apns.assert_called_once_with(
+            "apns-token-shared", "call_cancelled", self.call_id
+        )
+
 
 class DispatchCallPushAsyncTest(TestCase):
     """Tests for fire-and-forget async dispatch."""
@@ -664,22 +706,8 @@ class DispatchCallPushAsyncTest(TestCase):
 class SendVoipPushIosTest(TestCase):
     """Tests for send_voip_push_ios."""
 
-    FAKE_PEM = "-----BEGIN PRIVATE KEY-----\nfake-key-material\n-----END PRIVATE KEY-----\n"
-
     def _apns_config(self, **overrides: object) -> "patch._patch":
-        """Patch the module-level APNs config constants (read at import time,
-        so os.environ patching does nothing)."""
-        import zproject.nodl.services.call_push_service as cps
-
-        config = {
-            "APNS_KEY_ID": "ABC123DEFG",
-            "APNS_TEAM_ID": "8Z2F9BY77D",
-            "APNS_BUNDLE_ID": "tech.nodle.mobile",
-            "APNS_AUTH_KEY_B64": base64.b64encode(self.FAKE_PEM.encode()).decode(),
-            "APNS_AUTH_KEY_PATH": "",
-            **overrides,
-        }
-        return patch.multiple(cps, **config)
+        return apns_config(**overrides)
 
     def test_missing_apns_credentials_returns_false(self) -> None:
         """Returns False when APNs credentials are not configured."""
@@ -714,7 +742,7 @@ class SendVoipPushIosTest(TestCase):
 
         self.assertTrue(result)
         client_kwargs = mock_apns_cls.call_args.kwargs
-        self.assertEqual(client_kwargs["key"], self.FAKE_PEM)
+        self.assertEqual(client_kwargs["key"], FAKE_PEM)
         self.assertEqual(client_kwargs["key_id"], "ABC123DEFG")
         self.assertEqual(client_kwargs["team_id"], "8Z2F9BY77D")
         self.assertEqual(client_kwargs["topic"], "tech.nodle.mobile.voip")
@@ -809,7 +837,7 @@ class SendVoipPushIosTest(TestCase):
         import zproject.nodl.services.call_push_service as cps
 
         with tempfile.NamedTemporaryFile("w", suffix=".p8") as f:
-            f.write(self.FAKE_PEM)
+            f.write(FAKE_PEM)
             f.flush()
             with self._apns_config(APNS_AUTH_KEY_B64="", APNS_AUTH_KEY_PATH=f.name), \
                     patch("aioapns.APNs") as mock_apns_cls, \
@@ -822,7 +850,7 @@ class SendVoipPushIosTest(TestCase):
                 )
 
         self.assertTrue(result)
-        self.assertEqual(mock_apns_cls.call_args.kwargs["key"], self.FAKE_PEM)
+        self.assertEqual(mock_apns_cls.call_args.kwargs["key"], FAKE_PEM)
 
 
 class SendFcmCallDataTest(TestCase):
@@ -902,6 +930,178 @@ class SendFcmCallDataTest(TestCase):
 
         result = send_fcm_call_data("token", "call-id", "room", "Caller", "")
         self.assertFalse(result)
+
+
+# ===== Call lifecycle event pushes (cancel / decline / end / timeout) =====
+
+
+class SendApnsCallEventTest(TestCase):
+    """Tests for send_apns_call_event — the iOS regular-APNs background push."""
+
+    def test_background_push_shape(self) -> None:
+        """The event push is a regular APNs background push: bare-bundle topic
+        (NOT .voip), apns-push-type background, priority 5 (required by Apple
+        for background), content-available aps, per-call collapse id."""
+        from unittest.mock import AsyncMock
+
+        from aioapns import PushType
+
+        import zproject.nodl.services.call_push_service as cps
+
+        with apns_config(), \
+                patch("aioapns.APNs") as mock_apns_cls, \
+                patch("aioapns.NotificationRequest") as mock_request_cls:
+            mock_apns_cls.return_value.send_notification = AsyncMock(
+                return_value=MagicMock(is_successful=True)
+            )
+
+            result = cps.send_apns_call_event(
+                "apns-device-token", "call_cancelled", "call-1"
+            )
+
+        self.assertTrue(result)
+        client_kwargs = mock_apns_cls.call_args.kwargs
+        self.assertEqual(client_kwargs["topic"], "tech.nodle.mobile")
+        self.assertEqual(client_kwargs["key"], FAKE_PEM)
+        request_kwargs = mock_request_cls.call_args.kwargs
+        self.assertEqual(request_kwargs["push_type"], PushType.BACKGROUND)
+        self.assertEqual(request_kwargs["priority"], 5)
+        self.assertEqual(request_kwargs["time_to_live"], cps.APNS_EVENT_TTL_SECONDS)
+        self.assertEqual(request_kwargs["collapse_key"], "call-1")
+        self.assertEqual(request_kwargs["message"]["aps"], {"content-available": 1})
+        self.assertEqual(request_kwargs["message"]["type"], "call_cancelled")
+        self.assertEqual(request_kwargs["message"]["call_id"], "call-1")
+
+    def test_bad_device_token_retries_other_environment(self) -> None:
+        """The mixed sandbox/production fleet env-retry applies to event
+        pushes exactly as it does to VoIP ring pushes."""
+        from unittest.mock import AsyncMock
+
+        import zproject.nodl.services.call_push_service as cps
+
+        bad = MagicMock(is_successful=False, description="BadDeviceToken")
+        good = MagicMock(is_successful=True)
+        with apns_config(APNS_USE_SANDBOX=False), \
+                patch("aioapns.APNs") as mock_apns_cls, \
+                patch("aioapns.NotificationRequest"):
+            mock_apns_cls.return_value.send_notification = AsyncMock(
+                side_effect=[bad, good]
+            )
+            result = cps.send_apns_call_event(
+                "apns-device-token", "call_declined", "call-1"
+            )
+
+        self.assertTrue(result)
+        envs = [c.kwargs["use_sandbox"] for c in mock_apns_cls.call_args_list]
+        self.assertEqual(envs, [False, True])
+
+    def test_missing_credentials_returns_false(self) -> None:
+        import zproject.nodl.services.call_push_service as cps
+
+        with apns_config(APNS_KEY_ID=""):
+            result = cps.send_apns_call_event(
+                "apns-device-token", "call_cancelled", "call-1"
+            )
+        self.assertFalse(result)
+
+
+class DispatchCallEventPushTest(TestCase):
+    """Tests for dispatch_call_event_push platform routing."""
+
+    def setUp(self) -> None:
+        users = UserProfile.objects.filter(is_active=True)[:1]
+        assert len(users) >= 1
+        self.user = users[0]
+        self.call_id = str(uuid.uuid4())
+
+    @patch("zproject.nodl.services.call_push_service.send_apns_call_event")
+    @patch("zproject.nodl.services.call_push_service.send_fcm_call_event")
+    def test_android_fcm_token_receives_event(
+        self, mock_fcm: MagicMock, mock_apns: MagicMock
+    ) -> None:
+        DeviceVoipToken.objects.create(
+            user=self.user,
+            platform="android",
+            device_id="pixel-001",
+            fcm_token="fcm-token",
+        )
+        mock_fcm.return_value = "sent"
+
+        from zproject.nodl.services.call_push_service import dispatch_call_event_push
+
+        dispatch_call_event_push(self.user.id, "call_cancelled", self.call_id)
+
+        mock_fcm.assert_called_once_with("fcm-token", "call_cancelled", self.call_id)
+
+    @patch("zproject.nodl.services.call_push_service.send_apns_call_event")
+    @patch("zproject.nodl.services.call_push_service.send_fcm_call_event")
+    def test_ios_uses_regular_apns_token_never_voip_token(
+        self, mock_fcm: MagicMock, mock_apns: MagicMock
+    ) -> None:
+        """The iOS branch must send to PushDeviceToken kind=APNS — the VoIP
+        token namespace is PushKit-only and forbidden for non-call pushes."""
+        from zerver.models import PushDeviceToken
+
+        DeviceVoipToken.objects.create(
+            user=self.user,
+            platform="ios",
+            device_id="iphone-001",
+            voip_token="voip-token-NEVER-for-events",
+        )
+        PushDeviceToken.objects.create(
+            user=self.user,
+            kind=PushDeviceToken.APNS,
+            token="regular-apns-token",
+        )
+
+        from zproject.nodl.services.call_push_service import dispatch_call_event_push
+
+        dispatch_call_event_push(self.user.id, "call_declined", self.call_id)
+
+        mock_apns.assert_called_once_with(
+            "regular-apns-token", "call_declined", self.call_id
+        )
+        for call in mock_apns.call_args_list:
+            self.assertNotIn("voip-token-NEVER-for-events", call.args)
+
+    @patch("zproject.nodl.services.call_push_service.send_apns_call_event")
+    @patch("zproject.nodl.services.call_push_service.send_fcm_call_event")
+    def test_ios_without_apns_token_sends_nothing(
+        self, mock_fcm: MagicMock, mock_apns: MagicMock
+    ) -> None:
+        DeviceVoipToken.objects.create(
+            user=self.user,
+            platform="ios",
+            device_id="iphone-001",
+            voip_token="voip-token-only",
+        )
+
+        from zproject.nodl.services.call_push_service import dispatch_call_event_push
+
+        dispatch_call_event_push(self.user.id, "call_ended", self.call_id)
+
+        mock_apns.assert_not_called()
+        mock_fcm.assert_not_called()
+
+    @patch("zproject.nodl.services.call_push_service.send_apns_call_event")
+    @patch("zproject.nodl.services.call_push_service.send_fcm_call_event")
+    def test_unknown_event_type_sends_nothing(
+        self, mock_fcm: MagicMock, mock_apns: MagicMock
+    ) -> None:
+        from zerver.models import PushDeviceToken
+
+        PushDeviceToken.objects.create(
+            user=self.user,
+            kind=PushDeviceToken.APNS,
+            token="regular-apns-token",
+        )
+
+        from zproject.nodl.services.call_push_service import dispatch_call_event_push
+
+        dispatch_call_event_push(self.user.id, "call_exploded", self.call_id)
+
+        mock_apns.assert_not_called()
+        mock_fcm.assert_not_called()
 
 
 # ===== Integration: initiate_call triggers push dispatch =====
