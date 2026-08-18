@@ -1093,13 +1093,23 @@ def _dm_preview_text(message: Message) -> str:
     collapsed, and the result is truncated with an ellipsis.
     """
     # Local imports: don't pay the push-notifications import at module load.
-    from nodl.preview_text import strip_marker_text, strip_nodl_markers
+    from nodl.preview_text import (
+        split_inline_images,
+        strip_marker_text,
+        strip_nodl_markers,
+    )
     from zerver.lib.push_notifications import get_mobile_push_content
 
     text = message.content
+    image_count = 0
     if message.rendered_content:
         try:
-            text = get_mobile_push_content(strip_nodl_markers(message.rendered_content))
+            cleaned = strip_nodl_markers(message.rendered_content)
+            # Photos flatten to nothing useful (empty img alt) or worse — the
+            # raw upload filename from the link paragraph. Split them out and
+            # label below, mirroring the clients' typed classifier.
+            cleaned, image_count = split_inline_images(cleaned)
+            text = get_mobile_push_content(cleaned)
         except Exception:
             # An lxml parse failure must not 500 the inbox; raw content is
             # an acceptable degraded preview.
@@ -1116,6 +1126,13 @@ def _dm_preview_text(message: Message) -> str:
         text = _VOICE_FILENAME_RE.sub("", text)
         text = " ".join(text.split())
         text = f"🎤 {text}" if text else "🎤 Voice message"
+    elif image_count:
+        # Photo messages: `📷 <caption>` / `📷 Photo` — same shape as the
+        # voice label above and the clients' own classifier. (Old clients and
+        # web render this flattened text verbatim; new mobile clients ignore
+        # it in favor of rendered_content.)
+        text = " ".join(text.split())
+        text = f"📷 {text}" if text else "📷 Photo"
     text = " ".join(text.split())
     if len(text) > DM_PREVIEW_MAX_CHARS:
         text = text[:DM_PREVIEW_MAX_CHARS] + "…"

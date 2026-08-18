@@ -80,6 +80,51 @@ def _sole_anchor_href(element: lxml.html.HtmlElement) -> str | None:
     return anchor.get("href")
 
 
+def split_inline_images(html: str) -> tuple[str, int]:
+    """Separate inline image previews from ``html`` for preview flattening.
+
+    Returns ``(remainder_html, image_count)`` where the remainder has every
+    ``div.message_inline_image`` removed along with the bare upload-link
+    paragraph the renderer emits beside it (anchor-only ``<p>`` whose href
+    matches a removed image) — the flattened remainder is then the message's
+    caption text, if any. Mirrors the mobile client's classifier, which
+    renders those nodes as the photo itself, never as text.
+
+    Video previews (``message_inline_video``) are left untouched: they are
+    not photos, and their flattening behavior is unchanged.
+
+    On any parse failure returns ``(html, 0)``.
+    """
+    if not html or "message_inline_image" not in html:
+        return html, 0
+    try:
+        root = lxml.html.fragment_fromstring(html, create_parent="div")
+
+        image_hrefs: set[str] = set()
+        removed = 0
+        for div in list(root.find_class("message_inline_image")):
+            if "message_inline_video" in div.get("class", ""):
+                continue
+            anchor = div.find(".//a")
+            if anchor is not None and anchor.get("href"):
+                image_hrefs.add(anchor.get("href"))
+            _remove_preserving_tail(div)
+            removed += 1
+
+        if removed:
+            for paragraph in list(root.iter("p")):
+                href = _sole_anchor_href(paragraph)
+                if href is not None and href in image_hrefs:
+                    _remove_preserving_tail(paragraph)
+
+        remainder = (root.text or "") + "".join(
+            lxml.html.tostring(child, encoding="unicode") for child in root
+        )
+        return remainder, removed
+    except Exception:
+        return html, 0
+
+
 def strip_nodl_markers(html: str) -> str:
     """Return ``html`` with nodl machine markers removed, structure intact.
 

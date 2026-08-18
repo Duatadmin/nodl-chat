@@ -12,7 +12,7 @@ run under the plain-pytest CI job. Fixtures mirror the REAL rendered shapes:
 
 import unittest
 
-from nodl.preview_text import strip_marker_text, strip_nodl_markers
+from nodl.preview_text import split_inline_images, strip_marker_text, strip_nodl_markers
 
 FILE_CARD_HTML = (
     '<p><a href="/user_uploads/2/ab/T/test-letter.docx">test-letter.docx</a></p>\n'
@@ -81,6 +81,54 @@ class StripNodlMarkersTest(unittest.TestCase):
     def test_empty_and_garbage_inputs_returned_unchanged(self) -> None:
         self.assertEqual(strip_nodl_markers(""), "")
         self.assertEqual(strip_nodl_markers("   "), "   ")
+
+
+# Byte-shape of a real prod image message (mobile upload): bare upload-link
+# paragraph + thumbnail preview div (message id 1087, filenames shortened).
+INLINE_IMAGE_HTML = (
+    '<p><a href="/user_uploads/2/s2/image_picker_ABC.jpg">image_picker_ABC.jpg</a></p>\n'
+    '<div class="message_inline_image">'
+    '<a href="/user_uploads/2/s2/image_picker_ABC.jpg" title="image_picker_ABC.jpg">'
+    '<img src="/user_uploads/thumbnail/2/s2/image_picker_ABC.jpg/840x560.webp"></a></div>'
+)
+
+
+class SplitInlineImagesTest(unittest.TestCase):
+    def test_image_only_message_flattens_to_nothing(self) -> None:
+        # The preview div AND its bare upload-link paragraph both go — the
+        # remainder must NOT read the raw image_picker filename.
+        remainder, count = split_inline_images(INLINE_IMAGE_HTML)
+        self.assertEqual(count, 1)
+        self.assertEqual(_text_of(remainder), "")
+
+    def test_caption_survives(self) -> None:
+        html = "<p>Nice shot</p>\n" + INLINE_IMAGE_HTML
+        remainder, count = split_inline_images(html)
+        self.assertEqual(count, 1)
+        self.assertEqual(_text_of(remainder), "Nice shot")
+
+    def test_no_images_untouched(self) -> None:
+        html = "<p>Hello <strong>world</strong>!</p>"
+        self.assertEqual(split_inline_images(html), (html, 0))
+
+    def test_video_preview_not_counted_as_photo(self) -> None:
+        html = (
+            '<div class="message_inline_image message_inline_video">'
+            '<a href="https://example.com/clip.mp4"><video src="x"></video></a></div>'
+        )
+        remainder, count = split_inline_images(html)
+        self.assertEqual(count, 0)
+        self.assertIn("message_inline_video", remainder)
+
+    def test_unrelated_link_paragraph_kept(self) -> None:
+        # A link the user typed themselves (different href) is real content.
+        html = '<p><a href="https://example.com/doc">the doc</a></p>\n' + INLINE_IMAGE_HTML
+        remainder, count = split_inline_images(html)
+        self.assertEqual(count, 1)
+        self.assertEqual(_text_of(remainder), "the doc")
+
+    def test_empty_input_unchanged(self) -> None:
+        self.assertEqual(split_inline_images(""), ("", 0))
 
 
 class StripMarkerTextTest(unittest.TestCase):
