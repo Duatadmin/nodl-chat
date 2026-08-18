@@ -724,6 +724,30 @@ class SendVoipPushIosTest(TestCase):
         self.assertEqual(request_kwargs["time_to_live"], cps.APNS_VOIP_TTL_SECONDS)
         self.assertEqual(request_kwargs["message"]["recipient_user_id"], "57")
 
+    def test_send_works_from_loopless_thread(self) -> None:
+        """Regression: dispatch runs in a fire-and-forget thread with NO
+        asyncio event loop; aioapns grabs the loop at client construction,
+        which raised 'There is no current event loop in thread' in prod
+        (2026-08-18). The send must succeed from a bare worker thread."""
+        from unittest.mock import AsyncMock
+
+        import zproject.nodl.services.call_push_service as cps
+
+        results: list[bool] = []
+        with self._apns_config(), \
+                patch("aioapns.APNs") as mock_apns_cls, \
+                patch("aioapns.NotificationRequest"):
+            mock_apns_cls.return_value.send_notification = AsyncMock(
+                return_value=MagicMock(is_successful=True)
+            )
+            t = threading.Thread(target=lambda: results.append(
+                cps.send_voip_push_ios("voip-token", "call-id", "room", "C", "")
+            ))
+            t.start()
+            t.join(timeout=10)
+
+        self.assertEqual(results, [True])
+
     def test_invalid_b64_key_returns_false(self) -> None:
         """Garbage APNS_AUTH_KEY_B64 fails soft (skip, never raise)."""
         import zproject.nodl.services.call_push_service as cps

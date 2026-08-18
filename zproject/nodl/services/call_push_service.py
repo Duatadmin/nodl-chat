@@ -156,21 +156,14 @@ def send_voip_push_ios(
         return False
 
     try:
+        import asyncio
+
         from aioapns import APNs, NotificationRequest, PushType
-        from asgiref.sync import async_to_sync
 
         apns_key_content = _load_apns_auth_key()
         if apns_key_content is None:
             logger.warning("APNs auth key unavailable — skipping iOS VoIP push")
             return False
-
-        client = APNs(
-            key=apns_key_content,
-            key_id=APNS_KEY_ID,
-            team_id=APNS_TEAM_ID,
-            topic=f"{APNS_BUNDLE_ID}.voip",
-            use_sandbox=APNS_USE_SANDBOX,
-        )
 
         payload = {
             "call_id": call_id,
@@ -195,7 +188,24 @@ def send_voip_push_ios(
             time_to_live=APNS_VOIP_TTL_SECONDS,
         )
 
-        result = async_to_sync(client.send_notification)(request)
+        async def _send():
+            # aioapns captures the current event loop at CLIENT CONSTRUCTION
+            # (APNsKeyConnectionPool.__init__ → asyncio.get_event_loop()), and
+            # this runs in a fire-and-forget thread that has no loop — so the
+            # client must be built inside the same asyncio.run() as the send.
+            client = APNs(
+                key=apns_key_content,
+                key_id=APNS_KEY_ID,
+                team_id=APNS_TEAM_ID,
+                topic=f"{APNS_BUNDLE_ID}.voip",
+                use_sandbox=APNS_USE_SANDBOX,
+            )
+            try:
+                return await client.send_notification(request)
+            finally:
+                client.pool.close()
+
+        result = asyncio.run(_send())
 
         if not result.is_successful:
             logger.warning(
