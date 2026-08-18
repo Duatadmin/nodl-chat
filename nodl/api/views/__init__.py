@@ -7,6 +7,7 @@ from nodl.api.views.events import (
 )
 from nodl.api.views.internal import (
     deactivate_realm,
+    delete_user,
     sync_realm,
     sync_user,
 )
@@ -33,6 +34,7 @@ __all__ = [
     "send_typing",
     # Internal sync views
     "deactivate_realm",
+    "delete_user",
     "sync_realm",
     "sync_user",
     # Stream views

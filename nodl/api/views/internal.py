@@ -296,3 +296,73 @@ def deactivate_realm(request: HttpRequest) -> HttpResponse:
             {"result": "error", "code": "DEACTIVATION_FAILED", "msg": result.error},
             status=500,
         )
+
+
+@csrf_exempt
+@require_service_auth
+def delete_user(request: HttpRequest) -> HttpResponse:
+    """Hard-delete every Zulip profile for a nodl user (account deletion).
+
+    POST /api/v1/internal/users/delete
+
+    Called by nodl-backend's account-deletion purge task (App Store
+    Guideline 5.1.1(v)). Idempotent — repeating the call after the profiles
+    are gone succeeds with deleted_profiles=0.
+
+    Request body:
+    {
+        "supabase_user_id": "uuid"
+    }
+
+    Response:
+    {
+        "result": "success",
+        "deleted_profiles": 2,
+        "realm_ids": [3, 7]
+    }
+    """
+    if request.method != "POST":
+        return JsonResponse(
+            {"result": "error", "code": "METHOD_NOT_ALLOWED", "msg": "POST required"},
+            status=405,
+        )
+
+    try:
+        body = json.loads(request.body)
+        supabase_user_id = body.get("supabase_user_id")
+        if not supabase_user_id:
+            return JsonResponse(
+                {
+                    "result": "error",
+                    "code": "VALIDATION_ERROR",
+                    "msg": "supabase_user_id required",
+                },
+                status=400,
+            )
+    except json.JSONDecodeError:
+        return JsonResponse(
+            {"result": "error", "code": "INVALID_JSON", "msg": "Invalid JSON body"},
+            status=400,
+        )
+
+    from nodl.sync.user_deletion import UserDeletionService
+
+    logger.info(
+        "delete_user_request received",
+        extra={"supabase_user_id": supabase_user_id},
+    )
+    result = UserDeletionService().delete_user(supabase_user_id)
+
+    if result.success:
+        return JsonResponse(
+            {
+                "result": "success",
+                "deleted_profiles": result.deleted_profiles,
+                "realm_ids": result.realm_ids,
+            },
+            status=200,
+        )
+    return JsonResponse(
+        {"result": "error", "code": "DELETION_FAILED", "msg": result.error},
+        status=500,
+    )

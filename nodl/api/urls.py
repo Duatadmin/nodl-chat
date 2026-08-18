@@ -2,7 +2,7 @@
 
 from django.urls import path
 
-from nodl.api.views import deactivate_realm, sync_realm, sync_user
+from nodl.api.views import deactivate_realm, delete_user, sync_realm, sync_user
 from nodl.api.views.assistant import (
     get_task_stream_messages,
     send_assistant_message,
@@ -66,6 +66,7 @@ urlpatterns = [
     # Internal API endpoints - authenticated via service key
     # These are prefixed with /api/v1/internal/ by convention
     path("api/v1/internal/users/sync", sync_user, name="nodl_sync_user"),
+    path("api/v1/internal/users/delete", delete_user, name="nodl_delete_user"),
     path("api/v1/internal/realms/sync", sync_realm, name="nodl_sync_realm"),
     path("api/v1/internal/realms/deactivate", deactivate_realm, name="nodl_deactivate_realm"),
     path("api/v1/internal/task-streams/sync", sync_task_stream, name="nodl_sync_task_stream"),
