@@ -7,7 +7,6 @@ Bearer token (JWT) authentication, not browser session cookies.
 
 import json
 import logging
-import re
 from collections import defaultdict
 from collections.abc import Callable
 from contextlib import suppress
@@ -1075,65 +1074,19 @@ DM_PREVIEW_MAX_CHARS = 100
 DM_PREVIEW_RENDERED_MAX_CHARS = 4096
 DM_PREVIEW_RENDERED_BUDGET_CHARS = 262144
 
-# The voice-note filename discriminator (`voice-<epoch>.m4a`) as it appears
-# in preview text extracted from rendered_content.
-_VOICE_FILENAME_RE = re.compile(r"voice-\d+\.m4a")
-
 
 def _dm_preview_text(message: Message) -> str:
     """Plain-text preview of a message, matching how clients render it.
 
-    nodl machine markers (file cards, nodl-card/derived comments) are
-    stripped at the HTML level FIRST — see nodl/preview_text.py: the real
-    comment nodes lose their `<!--` delimiters during flattening and a
-    marker bisected by the truncation below is unstrippable afterwards, so
-    text-level stripping alone cannot work. Then Zulip's push-notification
-    HTML->text converter flattens the cleaned HTML (emoji spans, image alt
-    text, blockquotes, KaTeX, spoiler bodies stay hidden), whitespace is
-    collapsed, and the result is truncated with an ellipsis.
+    The whole pipeline (HTML-level marker strip, inline-image split,
+    flatten, 🎤/📷 labels) lives in nodl.message_preview so push
+    notification bodies use the exact same text — only the 100-char
+    truncation is chat-list-specific.
     """
-    # Local imports: don't pay the push-notifications import at module load.
-    from nodl.preview_text import (
-        split_inline_images,
-        strip_marker_text,
-        strip_nodl_markers,
-    )
-    from zerver.lib.push_notifications import get_mobile_push_content
+    # Local import: don't pay the push-notifications import at module load.
+    from nodl.message_preview import message_preview_text
 
-    text = message.content
-    image_count = 0
-    if message.rendered_content:
-        try:
-            cleaned = strip_nodl_markers(message.rendered_content)
-            # Photos flatten to nothing useful (empty img alt) or worse — the
-            # raw upload filename from the link paragraph. Split them out and
-            # label below, mirroring the clients' typed classifier.
-            cleaned, image_count = split_inline_images(cleaned)
-            text = get_mobile_push_content(cleaned)
-        except Exception:
-            # An lxml parse failure must not 500 the inbox; raw content is
-            # an acceptable degraded preview.
-            logger.exception("Failed to render DM preview for message %d", message.id)
-    # Belt-and-braces for whatever reached the text layer (e.g. the raw-
-    # content fallback above, whose markdown source carries escaped markers).
-    text = strip_marker_text(text)
-    # Voice notes (V2.11): never leak the raw `voice-….m4a` filename into the
-    # preview — show `🎤 <transcript>` once the derived transcript is attached
-    # to rendered_content, or a bare `🎤 Voice message` before it. Mirrors
-    # the mobile client's messagePreviewText so polled and live-derived
-    # previews render identically.
-    if _VOICE_FILENAME_RE.search(text):
-        text = _VOICE_FILENAME_RE.sub("", text)
-        text = " ".join(text.split())
-        text = f"🎤 {text}" if text else "🎤 Voice message"
-    elif image_count:
-        # Photo messages: `📷 <caption>` / `📷 Photo` — same shape as the
-        # voice label above and the clients' own classifier. (Old clients and
-        # web render this flattened text verbatim; new mobile clients ignore
-        # it in favor of rendered_content.)
-        text = " ".join(text.split())
-        text = f"📷 {text}" if text else "📷 Photo"
-    text = " ".join(text.split())
+    text = message_preview_text(message.rendered_content, message.content, message.id)
     if len(text) > DM_PREVIEW_MAX_CHARS:
         text = text[:DM_PREVIEW_MAX_CHARS] + "…"
     return text

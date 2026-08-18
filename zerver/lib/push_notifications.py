@@ -1022,12 +1022,24 @@ def get_base_payload(user_profile: UserProfile, for_legacy_clients: bool = True)
     """Common fields for all notification payloads."""
     data: dict[str, Any] = {}
 
+    # NODL MODIFICATION START - push payloads carry the root-domain URL
+    # Reason: nodl serves every realm from the bare EXTERNAL_HOST (clients
+    # authenticate via the Supabase bridge and store Account.realmUrl =
+    # root URL; there is no per-realm DNS — Railway only resolves the bare
+    # host). Zulip's realm.url is the subdomain form
+    # (https://<uuid>.<EXTERNAL_HOST>), which the mobile client can't match
+    # to any stored account: tapping a notification failed with "account
+    # not found". The payload's user_id disambiguates the workspace (one
+    # Account row per (realmUrl, userId)).
+    realm_url = settings.ROOT_DOMAIN_URI
+    # NODL MODIFICATION END
+
     # These will let the app support logging into multiple realms and servers.
     if for_legacy_clients:
         data["server"] = settings.EXTERNAL_HOST
         data["realm_id"] = user_profile.realm.id
-        data["realm_uri"] = user_profile.realm.url
-    data["realm_url"] = user_profile.realm.url
+        data["realm_uri"] = realm_url
+    data["realm_url"] = realm_url
     data["realm_name"] = user_profile.realm.name
     data["user_id"] = user_profile.id
 
@@ -1226,9 +1238,21 @@ def get_message_payload_apns(
     else:
         alert_title = get_apns_alert_title(message)
 
+    # NODL MODIFICATION START - canonical preview text for push bodies
+    # nodl messages carry machine markers in rendered_content: real HTML
+    # comment nodes crash get_mobile_push_content (lxml HtmlComment in
+    # potentially_collapse_quotes), and entity-escaped markers leak raw
+    # base64 into the notification body. Reuse the chat-list preview
+    # pipeline (marker strip + image split + 🎤/📷 labels) so push bodies
+    # match chat-list previews exactly.
+    from nodl.message_preview import message_preview_text
+
     assert message.rendered_content is not None
     with override_language(user_profile.default_language):
-        content, _ = truncate_content(get_mobile_push_content(message.rendered_content))
+        content, _ = truncate_content(
+            message_preview_text(message.rendered_content, message.content, message.id)
+        )
+        # NODL MODIFICATION END
         apns_data = {
             "alert": {
                 "title": alert_title,
@@ -1260,7 +1284,10 @@ def get_message_payload_gcm(
         sender_avatar_url = get_avatar_for_inaccessible_user()
         sender_name = str(UserProfile.INACCESSIBLE_USER_NAME)
     else:
-        sender_avatar_url = absolute_avatar_url(message.sender, message.realm.url)
+        # NODL MODIFICATION: root-domain URL — the per-realm subdomain host
+        # doesn't resolve, so the client's avatar fetch would fail (see
+        # get_base_payload).
+        sender_avatar_url = absolute_avatar_url(message.sender, settings.ROOT_DOMAIN_URI)
         sender_name = message.sender.full_name
 
     message_payload = dict(copy.deepcopy(message_payload))
@@ -1271,9 +1298,16 @@ def get_message_payload_gcm(
         message_payload["type"] = "message"
         message_payload["message_id"] = message.id
 
+    # NODL MODIFICATION START - canonical preview text for push bodies
+    # (see get_message_payload_apns above)
+    from nodl.message_preview import message_preview_text
+
     assert message.rendered_content is not None
     with override_language(user_profile.default_language):
-        content, _truncated = truncate_content(get_mobile_push_content(message.rendered_content))
+        content, _truncated = truncate_content(
+            message_preview_text(message.rendered_content, message.content, message.id)
+        )
+        # NODL MODIFICATION END
         message_payload.update(
             time=datetime_to_timestamp(message.date_sent),
             content=content,
@@ -1757,6 +1791,9 @@ def handle_push_notification(user_profile_id: int, missed_message: dict[str, Any
             "is_channel_message",
             "subject",
             "rendered_content",
+            # NODL: message_preview_text's degraded-path fallback; without
+            # this the deferred access would cost an extra query per push.
+            "content",
             "date_sent",
             "sender__recipient_id",
             "sender__realm_id",
