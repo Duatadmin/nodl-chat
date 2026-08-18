@@ -361,6 +361,34 @@ class HandleParticipantLeftTest(TestCase):
             call.duration_seconds,
         )
 
+    @patch("zproject.nodl.services.call_push_service.dispatch_call_event_push_async")
+    @patch("zproject.nodl.views.webhooks_livekit.insert_call_event_message")
+    def test_both_left_pushes_call_ended_to_both_parties(
+        self, mock_msg: MagicMock, mock_push: MagicMock
+    ) -> None:
+        """A client stranded alone in a dead call (accept/cancel race) has no
+        other signal that the call is over — the webhook must push it."""
+        call = CallRecord.objects.create(
+            room_name="call-stranded",
+            caller=self.caller,
+            callee=self.callee,
+            status="connected",
+            answered_at=timezone.now(),
+        )
+
+        _handle_participant_left("call-stranded", self._make_event(0))
+
+        recipients = {
+            (c.args[0], c.args[1], c.args[2]) for c in mock_push.call_args_list
+        }
+        self.assertEqual(
+            recipients,
+            {
+                (self.caller.id, "call_ended", str(call.id)),
+                (self.callee.id, "call_ended", str(call.id)),
+            },
+        )
+
     def test_one_still_in_room_no_action(self) -> None:
         """One participant still in room — no action."""
         call = CallRecord.objects.create(

@@ -272,6 +272,16 @@ def _handle_participant_left(room_name: str, event: object) -> None:
         call.end_reason = "room_empty"
         call.save(update_fields=["status", "ended_at", "duration_seconds", "end_reason"])
 
+    # Tell both parties' devices the call is over (best-effort). Clients
+    # that already tore down are idle and no-op on this — but a client
+    # stranded in a dead call (e.g. it accepted just as the caller
+    # cancelled, so the caller never joined) has no other signal: this
+    # webhook is the only place that notices the room genuinely emptied.
+    from zproject.nodl.services.call_push_service import dispatch_call_event_push_async
+
+    dispatch_call_event_push_async(call.caller_id, "call_ended", str(call.id))
+    dispatch_call_event_push_async(call.callee_id, "call_ended", str(call.id))
+
     # Exactly one path performs the connected→ended transition (the row lock +
     # status guards above make /end and this webhook mutually exclusive), so
     # the ended event is posted once per call.

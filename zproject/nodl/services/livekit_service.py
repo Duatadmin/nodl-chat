@@ -1,6 +1,7 @@
 import datetime
 import logging
 import os
+import threading
 
 from asgiref.sync import async_to_sync
 from livekit import api
@@ -104,3 +105,37 @@ def create_room_sync(
     correctly in Django's sync context.
     """
     return async_to_sync(create_room)(room_name, max_participants, empty_timeout)
+
+
+async def delete_room(room_name: str) -> None:
+    """Delete a LiveKit room, disconnecting any joined participants.
+
+    Raises:
+        ValueError: If LiveKit credentials are not configured.
+    """
+    if not LIVEKIT_URL or not LIVEKIT_API_KEY or not LIVEKIT_API_SECRET:
+        raise ValueError("LiveKit credentials not configured")
+
+    lkapi = api.LiveKitAPI(LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET)
+    try:
+        await lkapi.room.delete_room(api.DeleteRoomRequest(room=room_name))
+    finally:
+        await lkapi.aclose()
+
+
+def delete_room_async(room_name: str) -> None:
+    """Fire-and-forget best-effort room deletion (daemon thread).
+
+    Used when a call dies before connecting (cancel/decline): without this
+    the room stays joinable for empty_timeout more seconds, so a stale
+    accept can land a participant alone in a dead room. Errors are logged,
+    never raised — the empty_timeout auto-close remains the backstop.
+    """
+
+    def _run() -> None:
+        try:
+            async_to_sync(delete_room)(room_name)
+        except Exception as e:
+            logger.warning("LiveKit room deletion failed for %s: %s", room_name, e)
+
+    threading.Thread(target=_run, daemon=True).start()

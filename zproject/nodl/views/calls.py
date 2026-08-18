@@ -31,6 +31,7 @@ from zproject.nodl.services.livekit_service import (
     CALL_ROOM_MAX_PARTICIPANTS,
     LIVEKIT_URL,
     create_room_sync,
+    delete_room_async,
     generate_token,
 )
 
@@ -94,6 +95,26 @@ def _run_call_setup(
         # Non-fatal: token-embedded room config lets the first join
         # auto-create the room with the right shape.
         logger.error("LiveKit room creation failed for call %s: %s", call_id, e)
+
+    # The caller may have cancelled during the room-creation round trip.
+    # A VoIP push MUST ring on arrival (PushKit policy), and the cancel
+    # signal that would stop it is only best-effort — so re-read the status
+    # and never ring the callee for a call that is already dead. Fail-open:
+    # only a positively-read non-ringing status suppresses the push (a
+    # lookup failure must never eat a real ring).
+    try:
+        status = (
+            CallRecord.objects.filter(id=call_id)
+            .values_list("status", flat=True)
+            .first()
+        )
+    except Exception:
+        status = None
+    if status is not None and status != "ringing":
+        logger.info(
+            "Call %s is %r before ring push — skipping dispatch", call_id, status,
+        )
+        return
 
     dispatch_call_push(
         callee_id=callee_id,
@@ -440,6 +461,10 @@ def decline_call(
     # the full 30s timeout with no idea the callee declined.
     dispatch_call_event_push_async(call.caller_id, "call_declined", str(call.id))
 
+    # The call will never connect — close the room now (best-effort) instead
+    # of leaving it joinable for empty_timeout more seconds.
+    delete_room_async(call.room_name)
+
     # Insert DM event message (best-effort — never break the success response)
     insert_call_event_message(call, "declined")
 
@@ -504,6 +529,12 @@ def cancel_call(
     # Dismiss the callee's ringing UI immediately — without this their phone
     # keeps ringing for a call that no longer exists ("ghost ringing").
     dispatch_call_event_push_async(call.callee_id, "call_cancelled", str(call.id))
+
+    # The call will never connect — close the room now (best-effort) so a
+    # stale accept can't land the callee alone in it (the caller may also
+    # still be joined; deletion disconnects them, matching their local
+    # teardown, which already ran).
+    delete_room_async(call.room_name)
 
     # Insert DM event message (best-effort — never break the success response)
     insert_call_event_message(call, "cancelled")
@@ -692,4 +723,53 @@ def call_detail(
             "msg": "",
             "call": serialize_call_record(call, requesting_user_id=user_profile.id),
         }
+    )
+
+
+@csrf_exempt
+def call_ring_status(request: HttpRequest, call_id: str) -> HttpResponse:
+    """Whether a call is still ringing — the ghost-ring watchdog probe.
+
+    GET /nodl/calls/<call_id>/ring-status
+
+    The callee's ring starts with a PushKit push, which Apple guarantees to
+    deliver; the cancel signal rides a regular background push, which Apple
+    treats as best-effort (throttled, deferred, or never delivered to a
+    force-quit app). So while the native CallKit ring is up, the device
+    polls this endpoint and dismisses the ring as soon as the call stops
+    ringing server-side — cancelled, timed out, or accepted on a sibling
+    device.
+
+    Unauthenticated by design: the poll runs in the native (Swift) layer,
+    which holds no Zulip credentials — during a background ring the Dart
+    side may never have run. The unguessable call UUID is the capability,
+    and the response reveals a single ephemeral bit about it.
+    """
+    if request.method != "GET":
+        return JsonResponse(
+            {"result": "error", "msg": "Method not allowed", "code": "METHOD_NOT_ALLOWED"},
+            status=405,
+        )
+
+    try:
+        call_uuid = uuid.UUID(str(call_id))
+    except ValueError:
+        return JsonResponse(
+            {"result": "error", "msg": "Invalid call_id", "code": "BAD_REQUEST"},
+            status=400,
+        )
+
+    status = (
+        CallRecord.objects.filter(id=call_uuid)
+        .values_list("status", flat=True)
+        .first()
+    )
+    if status is None:
+        return JsonResponse(
+            {"result": "error", "msg": "Call not found", "code": "NOT_FOUND"},
+            status=404,
+        )
+
+    return JsonResponse(
+        {"result": "success", "msg": "", "ringing": status == "ringing"}
     )

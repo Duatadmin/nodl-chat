@@ -6,6 +6,7 @@ from zproject.nodl.views.calls import (
     accept_call,
     call_detail,
     call_history,
+    call_ring_status,
     calls_health,
     cancel_call,
     decline_call,
@@ -35,6 +36,12 @@ urlpatterns = [
     path("calls/<str:call_id>/decline", decline_call, name="nodl_calls_decline"),
     path("calls/<str:call_id>/cancel", cancel_call, name="nodl_calls_cancel"),
     path("calls/<str:call_id>/end", end_call, name="nodl_calls_end"),
+    # Unauthenticated ghost-ring watchdog probe (call UUID is the capability)
+    path(
+        "calls/<str:call_id>/ring-status",
+        call_ring_status,
+        name="nodl_calls_ring_status",
+    ),
     # Device VoIP token management
     path("devices/voip-token", register_voip_token, name="nodl_register_voip_token"),
     path("devices/voip-token/unregister", unregister_voip_token, name="nodl_unregister_voip_token"),

@@ -1185,14 +1185,14 @@ class InitiateCallPushIntegrationTest(ZulipTestCase):
         "zproject.nodl.services.livekit_service.LIVEKIT_API_SECRET",
         MOCK_LIVEKIT_ENV["LIVEKIT_API_SECRET"],
     )
-    @patch("zproject.nodl.views.calls.create_room_sync")
-    @patch("zproject.nodl.views.calls.dispatch_call_push_async")
+    @patch("zproject.nodl.views.calls._start_call_setup_async")
     def test_initiate_triggers_push_dispatch(
-        self, mock_dispatch: MagicMock, mock_create_room: MagicMock
+        self, mock_setup: MagicMock
     ) -> None:
-        """initiate_call calls dispatch_call_push_async with correct args."""
-        mock_create_room.return_value = {"name": "room", "sid": "sid"}
-
+        """initiate_call hands the room+push work to the setup thread with
+        the right identity (the thread itself is unit-tested in
+        RunCallSetupTest — a real thread here couldn't see the test
+        transaction's rows anyway)."""
         result = self.client_post(
             "/nodl/calls/initiate",
             json.dumps({"callee_id": self.callee.id}),
@@ -1202,11 +1202,11 @@ class InitiateCallPushIntegrationTest(ZulipTestCase):
         self.assertEqual(result.status_code, 200)
         self.assertEqual(result.json()["result"], "success")
 
-        # Verify dispatch was called
-        mock_dispatch.assert_called_once()
-        call_args = mock_dispatch.call_args
+        mock_setup.assert_called_once()
+        call_args = mock_setup.call_args
         self.assertEqual(call_args.kwargs["callee_id"], self.callee.id)
         self.assertEqual(call_args.kwargs["room_name"], result.json()["room_name"])
+        self.assertEqual(call_args.kwargs["call_id"], result.json()["call_id"])
         self.assertEqual(call_args.kwargs["caller_name"], self.caller.full_name)
 
     @patch.dict("os.environ", MOCK_LIVEKIT_ENV)
@@ -1219,22 +1219,18 @@ class InitiateCallPushIntegrationTest(ZulipTestCase):
         "zproject.nodl.services.livekit_service.LIVEKIT_API_SECRET",
         MOCK_LIVEKIT_ENV["LIVEKIT_API_SECRET"],
     )
-    @patch("zproject.nodl.views.calls.create_room_sync")
-    @patch("zproject.nodl.views.calls.dispatch_call_push_async")
+    @patch("zproject.nodl.views.calls._run_call_setup")
     def test_initiate_returns_before_push_completes(
-        self, mock_dispatch: MagicMock, mock_create_room: MagicMock
+        self, mock_run_setup: MagicMock
     ) -> None:
-        """Endpoint returns immediately — dispatch is fire-and-forget."""
-        mock_create_room.return_value = {"name": "room", "sid": "sid"}
-
-        # Make dispatch block to prove endpoint doesn't wait
+        """Endpoint returns immediately — setup is fire-and-forget."""
+        # Block the (real) setup thread to prove the endpoint doesn't wait.
         event = threading.Event()
-        original_dispatch = mock_dispatch.side_effect
 
-        def slow_dispatch(**kwargs: object) -> None:
+        def slow_setup(*args: object, **kwargs: object) -> None:
             event.wait(timeout=5)
 
-        mock_dispatch.side_effect = slow_dispatch
+        mock_run_setup.side_effect = slow_setup
 
         result = self.client_post(
             "/nodl/calls/initiate",
@@ -1243,6 +1239,6 @@ class InitiateCallPushIntegrationTest(ZulipTestCase):
             **self._auth_headers(),
         )
 
-        # Endpoint returned 200 even though dispatch hasn't completed
+        # Endpoint returned 200 even though setup hasn't completed
         self.assertEqual(result.status_code, 200)
         event.set()  # Unblock

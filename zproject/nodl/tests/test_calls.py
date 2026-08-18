@@ -163,6 +163,9 @@ class CallViewsTest(ZulipTestCase):
         event_patcher = patch("zproject.nodl.views.calls.dispatch_call_event_push_async")
         self.mock_event_push = event_patcher.start()
         self.addCleanup(event_patcher.stop)
+        room_delete_patcher = patch("zproject.nodl.views.calls.delete_room_async")
+        self.mock_room_delete = room_delete_patcher.start()
+        self.addCleanup(room_delete_patcher.stop)
 
     def _auth_headers(self, user: UserProfile | None = None) -> dict[str, str]:
         u = user or self.caller
@@ -314,6 +317,80 @@ class CallViewsTest(ZulipTestCase):
         self.assertEqual(call.status, "cancelled")
         self.assertIsNotNone(call.ended_at)
         self.assertEqual(call.end_reason, "caller_cancelled")
+
+    def test_cancel_deletes_livekit_room(self) -> None:
+        """Cancel closes the room so a stale accept can't join it."""
+        call = self._create_ringing_call()
+        result = self.client_post(
+            f"/nodl/calls/{call.id}/cancel",
+            content_type="application/json",
+            **self._auth_headers(self.caller),
+        )
+        self.assertEqual(result.status_code, 200)
+        self.mock_room_delete.assert_called_once_with(call.room_name)
+
+    def test_decline_deletes_livekit_room(self) -> None:
+        call = self._create_ringing_call()
+        result = self.client_post(
+            f"/nodl/calls/{call.id}/decline",
+            content_type="application/json",
+            **self._auth_headers(self.callee),
+        )
+        self.assertEqual(result.status_code, 200)
+        self.mock_room_delete.assert_called_once_with(call.room_name)
+
+    def test_failed_cancel_does_not_delete_room(self) -> None:
+        """A cancel rejected by the state guard must leave the room alone."""
+        call = self._create_connected_call()
+        result = self.client_post(
+            f"/nodl/calls/{call.id}/cancel",
+            content_type="application/json",
+            **self._auth_headers(self.caller),
+        )
+        self.assertEqual(result.status_code, 409)
+        self.mock_room_delete.assert_not_called()
+
+    # === Ring-status watchdog probe ===
+
+    def test_ring_status_ringing(self) -> None:
+        """Unauthenticated probe reports a ringing call as ringing."""
+        call = self._create_ringing_call()
+        result = self.client_get(f"/nodl/calls/{call.id}/ring-status")
+        self.assertEqual(result.status_code, 200)
+        data = result.json()
+        self.assertEqual(data["result"], "success")
+        self.assertTrue(data["ringing"])
+
+    def test_ring_status_cancelled(self) -> None:
+        call = self._create_ringing_call()
+        call.status = "cancelled"
+        call.save(update_fields=["status"])
+        result = self.client_get(f"/nodl/calls/{call.id}/ring-status")
+        self.assertEqual(result.status_code, 200)
+        self.assertFalse(result.json()["ringing"])
+
+    def test_ring_status_connected_not_ringing(self) -> None:
+        """Accepted (possibly on a sibling device) reads as not ringing."""
+        call = self._create_connected_call()
+        result = self.client_get(f"/nodl/calls/{call.id}/ring-status")
+        self.assertEqual(result.status_code, 200)
+        self.assertFalse(result.json()["ringing"])
+
+    def test_ring_status_unknown_call_404(self) -> None:
+        result = self.client_get(f"/nodl/calls/{uuid.uuid4()}/ring-status")
+        self.assertEqual(result.status_code, 404)
+
+    def test_ring_status_invalid_id_400(self) -> None:
+        result = self.client_get("/nodl/calls/not-a-uuid/ring-status")
+        self.assertEqual(result.status_code, 400)
+
+    def test_ring_status_post_not_allowed(self) -> None:
+        call = self._create_ringing_call()
+        result = self.client_post(
+            f"/nodl/calls/{call.id}/ring-status",
+            content_type="application/json",
+        )
+        self.assertEqual(result.status_code, 405)
 
     # === Race conditions ===
 
@@ -767,6 +844,9 @@ class CallBusyAndSignalingTest(ZulipTestCase):
         event_patcher = patch("zproject.nodl.views.calls.dispatch_call_event_push_async")
         self.mock_event_push = event_patcher.start()
         self.addCleanup(event_patcher.stop)
+        room_delete_patcher = patch("zproject.nodl.views.calls.delete_room_async")
+        self.mock_room_delete = room_delete_patcher.start()
+        self.addCleanup(room_delete_patcher.stop)
 
     def _auth_headers(self, user: UserProfile) -> dict[str, str]:
         cred = base64.b64encode(f"{user.delivery_email}:{user.api_key}".encode()).decode()
@@ -975,6 +1055,72 @@ class RunCallSetupTest(TestCase):
             callee_id=7,
             call_id="call-id-2",
             room_name="call-y",
+            caller_name="Hamlet",
+            caller_avatar_url="",
+        )
+        mock_push.assert_called_once()
+
+    def _make_call(self, status: str) -> CallRecord:
+        users = list(UserProfile.objects.filter(is_active=True)[:2])
+        assert len(users) >= 2
+        return CallRecord.objects.create(
+            room_name=f"call-{uuid.uuid4()}",
+            caller=users[0],
+            callee=users[1],
+            status=status,
+        )
+
+    @patch("zproject.nodl.views.calls.dispatch_call_push")
+    @patch("zproject.nodl.views.calls.create_room_sync")
+    def test_cancelled_call_skips_ring_push(
+        self, mock_create_room: MagicMock, mock_push: MagicMock
+    ) -> None:
+        """A cancel that lands during room provisioning must stop the ring
+        push — once the VoIP push is out, PushKit forces the phone to ring."""
+        from zproject.nodl.views.calls import _run_call_setup
+
+        call = self._make_call("cancelled")
+        mock_create_room.return_value = {"name": call.room_name, "sid": "RM_z"}
+        _run_call_setup(
+            callee_id=call.callee_id,
+            call_id=str(call.id),
+            room_name=call.room_name,
+            caller_name="Hamlet",
+            caller_avatar_url="",
+        )
+        mock_push.assert_not_called()
+
+    @patch("zproject.nodl.views.calls.dispatch_call_push")
+    @patch("zproject.nodl.views.calls.create_room_sync")
+    def test_still_ringing_call_pushes(
+        self, mock_create_room: MagicMock, mock_push: MagicMock
+    ) -> None:
+        from zproject.nodl.views.calls import _run_call_setup
+
+        call = self._make_call("ringing")
+        mock_create_room.return_value = {"name": call.room_name, "sid": "RM_r"}
+        _run_call_setup(
+            callee_id=call.callee_id,
+            call_id=str(call.id),
+            room_name=call.room_name,
+            caller_name="Hamlet",
+            caller_avatar_url="",
+        )
+        mock_push.assert_called_once()
+
+    @patch("zproject.nodl.views.calls.dispatch_call_push")
+    @patch("zproject.nodl.views.calls.create_room_sync")
+    def test_missing_record_fails_open_and_pushes(
+        self, mock_create_room: MagicMock, mock_push: MagicMock
+    ) -> None:
+        """A guard lookup failure must never eat a real ring."""
+        from zproject.nodl.views.calls import _run_call_setup
+
+        mock_create_room.return_value = {"name": "call-q", "sid": "RM_q"}
+        _run_call_setup(
+            callee_id=7,
+            call_id=str(uuid.uuid4()),
+            room_name="call-q",
             caller_name="Hamlet",
             caller_avatar_url="",
         )
