@@ -650,6 +650,54 @@ class DispatchCallPushFanOutTest(ZulipTestCase):
 
         self.assertEqual(mock_fcm.call_count, 1)
 
+    @patch("zproject.nodl.services.call_push_service.send_voip_push_ios")
+    @patch("zproject.nodl.services.call_push_service.send_fcm_call_data")
+    def test_unregistered_fallback_token_row_deleted(
+        self, mock_fcm: MagicMock, mock_ios: MagicMock
+    ) -> None:
+        """FCM 'unregistered' feedback on a PushDeviceToken fallback deletes
+        the dead row (self-heal — Zulip re-registers live devices), so legacy
+        dead tokens stop costing a send attempt on every dispatch."""
+        from zerver.models import PushDeviceToken
+
+        for profile in (self.profile_a, self.profile_b):
+            PushDeviceToken.objects.create(
+                user=profile,
+                kind=PushDeviceToken.FCM,
+                token="zulip-fcm-dead",
+            )
+        mock_fcm.return_value = "unregistered"
+
+        dispatch_call_push(
+            self.profile_a.id, self.call_id, self.room_name, "Caller", ""
+        )
+
+        self.assertEqual(
+            PushDeviceToken.objects.filter(token="zulip-fcm-dead").count(), 0
+        )
+
+    @patch("zproject.nodl.services.call_push_service.send_apns_call_event")
+    @patch("zproject.nodl.services.call_push_service.send_fcm_call_event")
+    def test_call_event_unregistered_fallback_token_row_deleted(
+        self, mock_fcm: MagicMock, mock_apns: MagicMock
+    ) -> None:
+        """Same self-heal on the event-push FCM fallback loop."""
+        from zerver.models import PushDeviceToken
+        from zproject.nodl.services.call_push_service import dispatch_call_event_push
+
+        PushDeviceToken.objects.create(
+            user=self.profile_b,
+            kind=PushDeviceToken.FCM,
+            token="zulip-fcm-dead-2",
+        )
+        mock_fcm.return_value = "unregistered"
+
+        dispatch_call_event_push(self.profile_a.id, "call_ended", self.call_id)
+
+        self.assertEqual(
+            PushDeviceToken.objects.filter(token="zulip-fcm-dead-2").count(), 0
+        )
+
     @patch("zproject.nodl.services.call_push_service.send_apns_call_event")
     @patch("zproject.nodl.services.call_push_service.send_fcm_call_event")
     def test_call_event_apns_token_dedupes_across_profiles(

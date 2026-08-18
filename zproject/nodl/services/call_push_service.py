@@ -468,6 +468,20 @@ def dispatch_call_push(
                 if result == "sent":
                     logger.info("FCM sent via PushDeviceToken fallback for user %s", callee_id)
                     break
+                if result == "unregistered":
+                    # Self-heal: FCM says the token is dead — delete the row
+                    # (Zulip's own push flow re-registers live devices), so
+                    # dead legacy tokens stop costing a send attempt on every
+                    # dispatch.
+                    deleted, _ = PushDeviceToken.objects.filter(
+                        user_id__in=profile_ids,
+                        kind=PushDeviceToken.FCM,
+                        token=fallback_token,
+                    ).delete()
+                    logger.info(
+                        "Deleted %d unregistered PushDeviceToken row(s) for token %s...",
+                        deleted, fallback_token[:16],
+                    )
 
     except Exception as e:
         logger.error("Push dispatch failed for callee %s: %s", callee_id, e)
@@ -662,7 +676,14 @@ def dispatch_call_event_push(user_id: int, event_type: str, call_id: str) -> Non
             if fallback_token in tried_fcm_tokens:
                 continue
             tried_fcm_tokens.add(fallback_token)
-            send_fcm_call_event(fallback_token, event_type, call_id)
+            result = send_fcm_call_event(fallback_token, event_type, call_id)
+            if result == "unregistered":
+                # Self-heal dead legacy tokens (see dispatch_call_push).
+                PushDeviceToken.objects.filter(
+                    user_id__in=profile_ids,
+                    kind=PushDeviceToken.FCM,
+                    token=fallback_token,
+                ).delete()
 
         # iOS: regular APNs background pushes to the app's Zulip-registered
         # device tokens (kind=APNS). These are the tokens from
