@@ -1065,6 +1065,16 @@ def delete_message(request: HttpRequest, message_id: int) -> HttpResponse:
 
 DM_PREVIEW_MAX_CHARS = 100
 
+# rendered_content is shipped alongside the flattened preview so clients can
+# run their own typed, localized classifier (the same one their live event
+# path uses). Caps keep the polled payload bounded: a message above the
+# per-row cap, or past the whole-response budget, just omits the field and
+# the client falls back to the flattened `content` preview. The budget is
+# assigned most-recent-first (after the recency sort), where previews matter
+# most. Clients must treat the field as optional — never emitted as null.
+DM_PREVIEW_RENDERED_MAX_CHARS = 4096
+DM_PREVIEW_RENDERED_BUDGET_CHARS = 262144
+
 # The voice-note filename discriminator (`voice-<epoch>.m4a`) as it appears
 # in preview text extracted from rendered_content.
 _VOICE_FILENAME_RE = re.compile(r"voice-\d+\.m4a")
@@ -1073,23 +1083,30 @@ _VOICE_FILENAME_RE = re.compile(r"voice-\d+\.m4a")
 def _dm_preview_text(message: Message) -> str:
     """Plain-text preview of a message, matching how clients render it.
 
-    Uses Zulip's push-notification HTML->text converter on rendered_content
-    (handles emoji spans, image alt text, blockquotes, KaTeX, spoilers), so
-    the polled preview agrees with a client that strips the rendered HTML —
-    instead of leaking raw Markdown source. Whitespace is collapsed and the
-    result is truncated with an ellipsis.
+    nodl machine markers (file cards, nodl-card/derived comments) are
+    stripped at the HTML level FIRST — see nodl/preview_text.py: the real
+    comment nodes lose their `<!--` delimiters during flattening and a
+    marker bisected by the truncation below is unstrippable afterwards, so
+    text-level stripping alone cannot work. Then Zulip's push-notification
+    HTML->text converter flattens the cleaned HTML (emoji spans, image alt
+    text, blockquotes, KaTeX, spoiler bodies stay hidden), whitespace is
+    collapsed, and the result is truncated with an ellipsis.
     """
-    # Local import: don't pay the push-notifications import at module load.
+    # Local imports: don't pay the push-notifications import at module load.
+    from nodl.preview_text import strip_marker_text, strip_nodl_markers
     from zerver.lib.push_notifications import get_mobile_push_content
 
     text = message.content
     if message.rendered_content:
         try:
-            text = get_mobile_push_content(message.rendered_content)
+            text = get_mobile_push_content(strip_nodl_markers(message.rendered_content))
         except Exception:
             # An lxml parse failure must not 500 the inbox; raw content is
             # an acceptable degraded preview.
             logger.exception("Failed to render DM preview for message %d", message.id)
+    # Belt-and-braces for whatever reached the text layer (e.g. the raw-
+    # content fallback above, whose markdown source carries escaped markers).
+    text = strip_marker_text(text)
     # Voice notes (V2.11): never leak the raw `voice-….m4a` filename into the
     # preview — show `🎤 <transcript>` once the derived transcript is attached
     # to rendered_content, or a bare `🎤 Voice message` before it. Mirrors
@@ -1148,6 +1165,11 @@ def list_dm_conversations(request: HttpRequest) -> HttpResponse:
                 "last_message": {
                     "id": 12345,
                     "content": "Hello!",          # plain text, <=100 chars + ellipsis
+                    # OPTIONAL: the message's rendered HTML, for clients that
+                    # classify previews themselves (typed, localized labels).
+                    # Omitted (never null) above the per-row cap or once the
+                    # response budget is spent — fall back to `content`.
+                    "rendered_content": "<p>Hello!</p>",
                     "preview_message_id": 12345,  # the message `content` belongs to
                     "sender_id": 9,
                     "sender_full_name": "Alice",
@@ -1288,6 +1310,12 @@ def list_dm_conversations(request: HttpRequest) -> HttpResponse:
                 "sender_full_name": last_message.sender.full_name,
                 "timestamp": int(last_message.date_sent.timestamp()),
             }
+            # Candidate for the optional rendered_content field, attached
+            # after the recency sort below so the response budget favors the
+            # rows the user actually sees first.
+            rendered = last_message.rendered_content
+            if rendered and len(rendered) <= DM_PREVIEW_RENDERED_MAX_CHARS:
+                last_message_data["_rendered_candidate"] = rendered
 
             max_message_id = data["max_message_id"]
             conversations.append(
@@ -1311,6 +1339,16 @@ def list_dm_conversations(request: HttpRequest) -> HttpResponse:
         # Most recent first. Message ids are monotonic on this server, so the
         # sort is stable and tie-free (second-granularity timestamps are not).
         conversations.sort(key=lambda c: c["last_message_id"], reverse=True)
+
+        # Attach rendered_content most-recent-first under the response
+        # budget; rows past it (or above the per-row cap) omit the field and
+        # clients fall back to the flattened `content` preview.
+        rendered_budget = DM_PREVIEW_RENDERED_BUDGET_CHARS
+        for conversation in conversations:
+            candidate = conversation["last_message"].pop("_rendered_candidate", None)
+            if candidate is not None and len(candidate) <= rendered_budget:
+                conversation["last_message"]["rendered_content"] = candidate
+                rendered_budget -= len(candidate)
 
         return JsonResponse(
             {
