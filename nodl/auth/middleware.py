@@ -246,6 +246,13 @@ class SupabaseJWTMiddleware:
         """
         if path in self.EXEMPT_EXACT:
             return True
+        # Ghost-ring watchdog probe (/nodl/calls/<uuid>/ring-status): polled by
+        # the native iOS layer while a CallKit ring is up, which holds no
+        # credentials (during a background ring the Dart side may never have
+        # run). The unguessable call UUID is the capability and the view
+        # returns a single boolean — see zproject/nodl/views/calls.py.
+        if path.startswith("/nodl/calls/") and path.endswith("/ring-status"):
+            return True
         return any(
             path == prefix or path.startswith(prefix if prefix.endswith("/") else prefix + "/")
             for prefix in self.EXEMPT_PREFIXES

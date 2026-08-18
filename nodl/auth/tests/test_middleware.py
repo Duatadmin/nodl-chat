@@ -214,6 +214,31 @@ class TestSupabaseJWTMiddleware:
         self.get_response.assert_called_once_with(request)
 
     @override_settings(SUPABASE_JWT_SECRET=TEST_JWT_SECRET)
+    def test_ring_status_probe_bypasses_auth(self) -> None:
+        """The ghost-ring watchdog probe is polled by the native iOS layer,
+        which holds no credentials — the call UUID is the capability."""
+        request = create_mock_request(
+            path="/nodl/calls/0f9b2b4e-8a44-4c1e-9d2a-1234567890ab/ring-status"
+        )
+
+        response = self.middleware(request)
+
+        assert response.status_code == 200
+        self.get_response.assert_called_once_with(request)
+
+    @override_settings(SUPABASE_JWT_SECRET=TEST_JWT_SECRET)
+    def test_other_call_endpoints_still_require_auth(self) -> None:
+        """The ring-status exemption must not leak onto its siblings."""
+        for path in (
+            "/nodl/calls/0f9b2b4e-8a44-4c1e-9d2a-1234567890ab/accept",
+            "/nodl/calls/0f9b2b4e-8a44-4c1e-9d2a-1234567890ab",
+            "/nodl/calls/history",
+        ):
+            request = create_mock_request(path=path)
+            response = self.middleware(request)
+            assert response.status_code == 401, path
+
+    @override_settings(SUPABASE_JWT_SECRET=TEST_JWT_SECRET)
     def test_websocket_token_via_query_param(self) -> None:
         """Test that WebSocket connections can pass token via query param."""
         token = create_valid_token()
