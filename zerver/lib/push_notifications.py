@@ -174,14 +174,10 @@ def has_apns_credentials() -> bool:
     return settings.APNS_TOKEN_KEY_FILE is not None or settings.APNS_CERT_FILE is not None
 
 
-@cache
-def get_apns_context() -> APNsContext | None:
+def _build_apns_context(use_sandbox: bool) -> APNsContext:
     # We lazily do this import as part of optimizing Zulip's base
     # import time.
     import aioapns
-
-    if not has_apns_credentials():  # nocoverage
-        return None
 
     # NB if called concurrently, this will make excess connections.
     # That's a little sloppy, but harmless unless a server gets
@@ -208,7 +204,7 @@ def get_apns_context() -> APNsContext | None:
             key_id=settings.APNS_TOKEN_KEY_ID,
             team_id=settings.APNS_TEAM_ID,
             max_connection_attempts=APNS_MAX_RETRIES,
-            use_sandbox=settings.APNS_SANDBOX,
+            use_sandbox=use_sandbox,
             err_func=err_func,
             # The actual APNs topic will vary between notifications,
             # so we set it there, overriding any value we put here.
@@ -219,6 +215,34 @@ def get_apns_context() -> APNsContext | None:
 
     apns = loop.run_until_complete(make_apns())
     return APNsContext(apns=apns, loop=loop)
+
+
+@cache
+def get_apns_context() -> APNsContext | None:
+    if not has_apns_credentials():  # nocoverage
+        return None
+
+    return _build_apns_context(settings.APNS_SANDBOX)
+
+
+# NODL MODIFICATION START - APNs environment-mismatch retry
+# Reason: the device fleet mixes signing environments — dev-signed builds
+# (Mac pipeline) register SANDBOX device tokens while TestFlight/App Store
+# builds register PRODUCTION tokens — and the token rows don't record which.
+# A send to the wrong environment fails with BadDeviceToken, which
+# send_apple_push_notification treats as fatal and DELETES the row (also
+# breaking the call-event pushes that read the same PushDeviceToken rows).
+# Mirrors call_push_service._apns_send_with_env_retry.
+# Date: 2026-08-18
+@cache
+def get_apns_context_other_env() -> APNsContext | None:
+    if not has_apns_credentials():  # nocoverage
+        return None
+
+    return _build_apns_context(not settings.APNS_SANDBOX)
+
+
+# NODL MODIFICATION END
 
 
 APNS_MAX_RETRIES = 3
@@ -352,6 +376,33 @@ def send_apple_push_notification(
             )
         except BaseException as e:
             results[device] = e
+
+        # NODL MODIFICATION START - APNs environment-mismatch retry
+        # BadDeviceToken usually means the token belongs to the OTHER APNs
+        # environment (mixed dev-signed/TestFlight fleet); retry once there
+        # before the result handling below deletes the token row. If the
+        # retry also fails with BadDeviceToken, the token is invalid in both
+        # environments and deletion is correct.
+        result = results[device]
+        if (
+            not isinstance(result, BaseException)
+            and not result.is_successful
+            and result.description == "BadDeviceToken"
+        ):
+            other_context = get_apns_context_other_env()
+            if other_context is not None:
+                logger.info(
+                    "APNs: BadDeviceToken in %s env for device %s; retrying other env",
+                    "sandbox" if settings.APNS_SANDBOX else "production",
+                    device.token,
+                )
+                try:
+                    results[device] = other_context.loop.run_until_complete(
+                        other_context.apns.send_notification(request)
+                    )
+                except BaseException as e:
+                    results[device] = e
+        # NODL MODIFICATION END
 
     successfully_sent_count = 0
     for device, result in results.items():

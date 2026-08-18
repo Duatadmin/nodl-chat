@@ -41,6 +41,59 @@ echo "=== Secrets file created ==="
 echo "File contents (first 2 lines):"
 head -2 /etc/zulip/zulip-secrets.conf
 
+# Materialize mobile-push credential files for Zulip's native senders.
+# zerver/lib/push_notifications.py reads file paths (APNS_TOKEN_KEY_FILE,
+# ANDROID_FCM_CREDENTIALS_PATH); Railway delivers env vars. These are the
+# same env vars the nodl call-push service already uses.
+if [ -n "$APNS_AUTH_KEY_B64" ]; then
+    if echo "$APNS_AUTH_KEY_B64" | base64 -d > /etc/zulip/apns_auth_key.p8 2>/dev/null; then
+        chown zulip:zulip /etc/zulip/apns_auth_key.p8
+        chmod 640 /etc/zulip/apns_auth_key.p8
+        echo "=== APNs auth key written to /etc/zulip/apns_auth_key.p8 ==="
+    else
+        rm -f /etc/zulip/apns_auth_key.p8
+        echo "WARNING: APNS_AUTH_KEY_B64 set but base64 decode failed; native APNs push disabled"
+    fi
+fi
+if [ -n "$FIREBASE_CREDENTIALS_JSON" ]; then
+    # Same parse strategies as call_push_service._parse_firebase_json
+    # (raw JSON / base64 / newline-mangled), normalized via json.dump.
+    if /app/.venv/bin/python - <<'PYEOF'
+import base64, json, os, sys
+
+raw = os.environ["FIREBASE_CREDENTIALS_JSON"]
+stripped = raw.strip().strip('"').strip("'")
+parsed = None
+try:
+    parsed = json.loads(stripped)
+except ValueError:
+    pass
+if parsed is None:
+    try:
+        parsed = json.loads(base64.b64decode(stripped).decode("utf-8"))
+    except Exception:
+        pass
+if parsed is None:
+    try:
+        parsed = json.loads(stripped.replace("\r", "").replace("\n", "\\n"))
+    except ValueError:
+        pass
+if parsed is None:
+    print("Cannot parse FIREBASE_CREDENTIALS_JSON (tried raw, base64, newline-fix)", file=sys.stderr)
+    sys.exit(1)
+with open("/etc/zulip/firebase-credentials.json", "w") as f:
+    json.dump(parsed, f)
+PYEOF
+    then
+        chown zulip:zulip /etc/zulip/firebase-credentials.json
+        chmod 640 /etc/zulip/firebase-credentials.json
+        echo "=== Firebase credentials written to /etc/zulip/firebase-credentials.json ==="
+    else
+        rm -f /etc/zulip/firebase-credentials.json
+        echo "WARNING: FIREBASE_CREDENTIALS_JSON set but unparseable; native FCM push disabled"
+    fi
+fi
+
 # Create zulip schema if it doesn't exist (required before migrations)
 # Zulip's setup scripts normally do this, but Railway has a fresh PostgreSQL
 # Using Python/psycopg2 since psql client is not installed in the container

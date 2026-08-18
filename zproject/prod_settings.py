@@ -64,3 +64,36 @@ S3_ADDRESSING_STYLE = "path"  # R2 prefers path-style URLs
 S3_KEY = os.environ.get("S3_KEY")
 S3_SECRET_KEY = os.environ.get("S3_SECRET_KEY")
 # NODL MODIFICATION END
+
+################################################################
+# Mobile push notifications (native APNs + FCM, no bouncer)
+################################################################
+
+# NODL MODIFICATION START - Native mobile push notifications
+# Reason: Zulip's message-push senders read credentials from FILE paths;
+# entrypoint.sh materializes those files from the same Railway env vars the
+# nodl call-push service uses (APNS_AUTH_KEY_B64, FIREBASE_CREDENTIALS_JSON).
+# NOTE: upstream defines APNS_TOKEN_KEY_ID / APNS_TEAM_ID via
+# get_secret(..., development_only=True), which ALWAYS resolves to None in
+# production — secrets-file entries silently do nothing, so the literal
+# overrides below are the only working configuration path.
+# Date: 2026-08-18
+_apns_token_key_file = "/etc/zulip/apns_auth_key.p8"
+if os.path.isfile(_apns_token_key_file) and os.environ.get("APNS_KEY_ID"):
+    APNS_TOKEN_KEY_FILE = _apns_token_key_file
+    APNS_TOKEN_KEY_ID = os.environ.get("APNS_KEY_ID")
+    APNS_TEAM_ID = os.environ.get("APNS_TEAM_ID")
+    # false => production APNs. The device fleet is mixed (dev-signed builds
+    # hold sandbox tokens, TestFlight builds production tokens); the
+    # env-mismatch retry in zerver/lib/push_notifications.py covers the
+    # other environment.
+    APNS_SANDBOX = os.environ.get("APNS_USE_SANDBOX", "false").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+
+_fcm_credentials_file = "/etc/zulip/firebase-credentials.json"
+if os.path.isfile(_fcm_credentials_file):
+    ANDROID_FCM_CREDENTIALS_PATH = _fcm_credentials_file
+# NODL MODIFICATION END
