@@ -664,6 +664,23 @@ class DispatchCallPushAsyncTest(TestCase):
 class SendVoipPushIosTest(TestCase):
     """Tests for send_voip_push_ios."""
 
+    FAKE_PEM = "-----BEGIN PRIVATE KEY-----\nfake-key-material\n-----END PRIVATE KEY-----\n"
+
+    def _apns_config(self, **overrides: str) -> "patch._patch":
+        """Patch the module-level APNs config constants (read at import time,
+        so os.environ patching does nothing)."""
+        import zproject.nodl.services.call_push_service as cps
+
+        config = {
+            "APNS_KEY_ID": "ABC123DEFG",
+            "APNS_TEAM_ID": "8Z2F9BY77D",
+            "APNS_BUNDLE_ID": "tech.nodle.mobile",
+            "APNS_AUTH_KEY_B64": base64.b64encode(self.FAKE_PEM.encode()).decode(),
+            "APNS_AUTH_KEY_PATH": "",
+            **overrides,
+        }
+        return patch.multiple(cps, **config)
+
     def test_missing_apns_credentials_returns_false(self) -> None:
         """Returns False when APNs credentials are not configured."""
         from zproject.nodl.services.call_push_service import send_voip_push_ios
@@ -673,6 +690,72 @@ class SendVoipPushIosTest(TestCase):
                 "token", "call-id", "room", "Caller", ""
             )
             self.assertFalse(result)
+
+    def test_b64_key_sends_voip_push_with_required_headers(self) -> None:
+        """APNS_AUTH_KEY_B64 (no file) is decoded and the push carries the
+        VoIP essentials: .voip topic, apns-push-type voip, priority 10, TTL."""
+        from unittest.mock import AsyncMock
+
+        from aioapns import PushType
+
+        import zproject.nodl.services.call_push_service as cps
+
+        with self._apns_config(), \
+                patch("aioapns.APNs") as mock_apns_cls, \
+                patch("aioapns.NotificationRequest") as mock_request_cls:
+            mock_apns_cls.return_value.send_notification = AsyncMock(
+                return_value=MagicMock(is_successful=True)
+            )
+
+            result = cps.send_voip_push_ios(
+                "voip-token", "call-id", "room", "Caller", "",
+                recipient_user_id="57",
+            )
+
+        self.assertTrue(result)
+        client_kwargs = mock_apns_cls.call_args.kwargs
+        self.assertEqual(client_kwargs["key"], self.FAKE_PEM)
+        self.assertEqual(client_kwargs["key_id"], "ABC123DEFG")
+        self.assertEqual(client_kwargs["team_id"], "8Z2F9BY77D")
+        self.assertEqual(client_kwargs["topic"], "tech.nodle.mobile.voip")
+        request_kwargs = mock_request_cls.call_args.kwargs
+        self.assertEqual(request_kwargs["push_type"], PushType.VOIP)
+        self.assertEqual(request_kwargs["priority"], 10)
+        self.assertEqual(request_kwargs["time_to_live"], cps.APNS_VOIP_TTL_SECONDS)
+        self.assertEqual(request_kwargs["message"]["recipient_user_id"], "57")
+
+    def test_invalid_b64_key_returns_false(self) -> None:
+        """Garbage APNS_AUTH_KEY_B64 fails soft (skip, never raise)."""
+        import zproject.nodl.services.call_push_service as cps
+
+        with self._apns_config(APNS_AUTH_KEY_B64="!!!not-base64!!!"):
+            result = cps.send_voip_push_ios(
+                "voip-token", "call-id", "room", "Caller", ""
+            )
+        self.assertFalse(result)
+
+    def test_file_path_fallback_still_works(self) -> None:
+        """Without B64, the key is read from APNS_AUTH_KEY_PATH as before."""
+        import tempfile
+        from unittest.mock import AsyncMock
+
+        import zproject.nodl.services.call_push_service as cps
+
+        with tempfile.NamedTemporaryFile("w", suffix=".p8") as f:
+            f.write(self.FAKE_PEM)
+            f.flush()
+            with self._apns_config(APNS_AUTH_KEY_B64="", APNS_AUTH_KEY_PATH=f.name), \
+                    patch("aioapns.APNs") as mock_apns_cls, \
+                    patch("aioapns.NotificationRequest"):
+                mock_apns_cls.return_value.send_notification = AsyncMock(
+                    return_value=MagicMock(is_successful=True)
+                )
+                result = cps.send_voip_push_ios(
+                    "voip-token", "call-id", "room", "Caller", ""
+                )
+
+        self.assertTrue(result)
+        self.assertEqual(mock_apns_cls.call_args.kwargs["key"], self.FAKE_PEM)
 
 
 class SendFcmCallDataTest(TestCase):

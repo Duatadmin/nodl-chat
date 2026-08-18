@@ -19,6 +19,8 @@
 ## Config files for the dev environment
 /zproject/apns-dev.pem
 /zproject/apns-dev-key.p8
+# No APNs auth key may ever be committed, wherever it lands in the tree.
+*.p8
 /zproject/dev-secrets.conf
 /zproject/custom_dev_settings.py
 /tools/conf.ini

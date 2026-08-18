@@ -14,9 +14,34 @@ logger = logging.getLogger(__name__)
 # ---------- APNs config (iOS VoIP push via aioapns) ----------
 APNS_KEY_ID = os.environ.get("APNS_KEY_ID", "")
 APNS_TEAM_ID = os.environ.get("APNS_TEAM_ID", "")
+# The .p8 auth key, either as a file path or inline base64 (Railway can only
+# deliver env vars, not files — base64 wins when both are set).
 APNS_AUTH_KEY_PATH = os.environ.get("APNS_AUTH_KEY_PATH", "")
+APNS_AUTH_KEY_B64 = os.environ.get("APNS_AUTH_KEY_B64", "")
 APNS_BUNDLE_ID = os.environ.get("APNS_BUNDLE_ID", "")
 APNS_USE_SANDBOX = os.environ.get("APNS_USE_SANDBOX", "true").lower() == "true"
+
+# A VoIP push delivered after the ring window is a ghost ring (the server has
+# already marked the call missed) — let APNs drop it instead of delivering late.
+APNS_VOIP_TTL_SECONDS = 45
+
+
+def _load_apns_auth_key() -> str | None:
+    """Return the .p8 key PEM content, or None if unavailable. Never raises."""
+    if APNS_AUTH_KEY_B64:
+        try:
+            return base64.b64decode(APNS_AUTH_KEY_B64).decode("utf-8")
+        except Exception as e:
+            logger.error("APNS_AUTH_KEY_B64 is not valid base64: %s", e)
+            return None
+    if APNS_AUTH_KEY_PATH:
+        try:
+            with open(APNS_AUTH_KEY_PATH) as f:
+                return f.read()
+        except OSError as e:
+            logger.error("Cannot read APNS_AUTH_KEY_PATH: %s", e)
+            return None
+    return None
 
 # ---------- FCM config (Android data message) ----------
 # firebase-admin initializes from GOOGLE_APPLICATION_CREDENTIALS env var
@@ -124,16 +149,20 @@ def send_voip_push_ios(
 
     Returns True on success, False on failure. Never raises.
     """
-    if not all([APNS_KEY_ID, APNS_TEAM_ID, APNS_AUTH_KEY_PATH, APNS_BUNDLE_ID]):
+    if not all([APNS_KEY_ID, APNS_TEAM_ID, APNS_BUNDLE_ID]) or not (
+        APNS_AUTH_KEY_B64 or APNS_AUTH_KEY_PATH
+    ):
         logger.warning("APNs credentials not configured — skipping iOS VoIP push")
         return False
 
     try:
-        from aioapns import APNs, NotificationRequest
+        from aioapns import APNs, NotificationRequest, PushType
         from asgiref.sync import async_to_sync
 
-        with open(APNS_AUTH_KEY_PATH) as f:
-            apns_key_content = f.read()
+        apns_key_content = _load_apns_auth_key()
+        if apns_key_content is None:
+            logger.warning("APNs auth key unavailable — skipping iOS VoIP push")
+            return False
 
         client = APNs(
             key=apns_key_content,
@@ -155,9 +184,15 @@ def send_voip_push_ios(
             "recipient_workspace_id": recipient_workspace_id,
         }
 
+        # apns-push-type MUST be "voip" on the .voip topic (required since
+        # iOS 13); priority 10 = deliver immediately; the TTL lets APNs drop
+        # a push that could only arrive after the ring window (ghost ring).
         request = NotificationRequest(
             device_token=voip_token,
             message=payload,
+            push_type=PushType.VOIP,
+            priority=10,
+            time_to_live=APNS_VOIP_TTL_SECONDS,
         )
 
         result = async_to_sync(client.send_notification)(request)
