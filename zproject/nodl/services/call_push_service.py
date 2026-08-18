@@ -188,7 +188,7 @@ def send_voip_push_ios(
             time_to_live=APNS_VOIP_TTL_SECONDS,
         )
 
-        async def _send():
+        async def _send(use_sandbox: bool):
             # aioapns captures the current event loop at CLIENT CONSTRUCTION
             # (APNsKeyConnectionPool.__init__ → asyncio.get_event_loop()), and
             # this runs in a fire-and-forget thread that has no loop — so the
@@ -198,14 +198,29 @@ def send_voip_push_ios(
                 key_id=APNS_KEY_ID,
                 team_id=APNS_TEAM_ID,
                 topic=f"{APNS_BUNDLE_ID}.voip",
-                use_sandbox=APNS_USE_SANDBOX,
+                use_sandbox=use_sandbox,
             )
             try:
                 return await client.send_notification(request)
             finally:
                 client.pool.close()
 
-        result = asyncio.run(_send())
+        result = asyncio.run(_send(APNS_USE_SANDBOX))
+
+        # BadDeviceToken usually means the token belongs to the OTHER APNs
+        # environment: dev-signed installs (Mac-pipeline builds) carry sandbox
+        # tokens, TestFlight/App Store installs carry production tokens, and
+        # both coexist on this fleet. Retry once against the other environment
+        # so every install flavor rings without per-device config.
+        if not result.is_successful and result.description == "BadDeviceToken":
+            other_env = not APNS_USE_SANDBOX
+            logger.info(
+                "APNs %s rejected token %s... (BadDeviceToken) — retrying %s",
+                "sandbox" if APNS_USE_SANDBOX else "production",
+                voip_token[:16],
+                "sandbox" if other_env else "production",
+            )
+            result = asyncio.run(_send(other_env))
 
         if not result.is_successful:
             logger.warning(

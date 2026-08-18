@@ -666,7 +666,7 @@ class SendVoipPushIosTest(TestCase):
 
     FAKE_PEM = "-----BEGIN PRIVATE KEY-----\nfake-key-material\n-----END PRIVATE KEY-----\n"
 
-    def _apns_config(self, **overrides: str) -> "patch._patch":
+    def _apns_config(self, **overrides: object) -> "patch._patch":
         """Patch the module-level APNs config constants (read at import time,
         so os.environ patching does nothing)."""
         import zproject.nodl.services.call_push_service as cps
@@ -747,6 +747,49 @@ class SendVoipPushIosTest(TestCase):
             t.join(timeout=10)
 
         self.assertEqual(results, [True])
+
+    def test_bad_device_token_retries_other_environment(self) -> None:
+        """Env mismatch (dev-signed = sandbox token, TestFlight = production
+        token): production BadDeviceToken → one sandbox retry, and vice versa."""
+        from unittest.mock import AsyncMock
+
+        import zproject.nodl.services.call_push_service as cps
+
+        bad = MagicMock(is_successful=False, description="BadDeviceToken")
+        good = MagicMock(is_successful=True)
+        with self._apns_config(APNS_USE_SANDBOX=False), \
+                patch("aioapns.APNs") as mock_apns_cls, \
+                patch("aioapns.NotificationRequest"):
+            mock_apns_cls.return_value.send_notification = AsyncMock(
+                side_effect=[bad, good]
+            )
+            result = cps.send_voip_push_ios(
+                "voip-token", "call-id", "room", "C", ""
+            )
+
+        self.assertTrue(result)
+        envs = [c.kwargs["use_sandbox"] for c in mock_apns_cls.call_args_list]
+        self.assertEqual(envs, [False, True])
+
+    def test_non_token_failure_does_not_retry(self) -> None:
+        """Only BadDeviceToken triggers the environment retry."""
+        from unittest.mock import AsyncMock
+
+        import zproject.nodl.services.call_push_service as cps
+
+        bad = MagicMock(is_successful=False, description="TooManyRequests")
+        with self._apns_config(APNS_USE_SANDBOX=False), \
+                patch("aioapns.APNs") as mock_apns_cls, \
+                patch("aioapns.NotificationRequest"):
+            mock_apns_cls.return_value.send_notification = AsyncMock(
+                return_value=bad
+            )
+            result = cps.send_voip_push_ios(
+                "voip-token", "call-id", "room", "C", ""
+            )
+
+        self.assertFalse(result)
+        self.assertEqual(mock_apns_cls.call_count, 1)
 
     def test_invalid_b64_key_returns_false(self) -> None:
         """Garbage APNS_AUTH_KEY_B64 fails soft (skip, never raise)."""
