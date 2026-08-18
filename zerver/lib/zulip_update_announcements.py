@@ -713,6 +713,11 @@ def send_messages_and_update_level(
 
 
 def send_zulip_update_announcements(skip_delay: bool, progress: bool = False) -> None:
+    if not settings.NODL_ENABLE_ZULIP_UPDATE_ANNOUNCEMENTS:
+        # nodl fork: upstream's feature announcements are Zulip-branded
+        # changelog messages irrelevant to Nodle users. See
+        # NODL_ENABLE_ZULIP_UPDATE_ANNOUNCEMENTS in default_settings.py.
+        return
     latest_zulip_update_announcements_level = get_latest_zulip_update_announcements_level()
     realms = get_realms_behind_zulip_update_announcements_level(
         level=latest_zulip_update_announcements_level

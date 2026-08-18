@@ -15,6 +15,7 @@ from zerver.actions.realm_settings import (
     do_deactivate_realm,
 )
 from zerver.lib.bulk_create import create_users
+from zerver.lib.nodl_branding import debrand
 from zerver.lib.push_notifications import sends_notifications_directly
 from zerver.lib.remote_server import maybe_enqueue_audit_log_upload
 from zerver.lib.server_initialization import create_internal_realm, server_initialized
@@ -323,14 +324,14 @@ def do_create_realm(
         if create_zulip_discussion_channel:
             zulip_discussion_channel = ensure_stream(
                 realm,
-                str(Realm.ZULIP_DISCUSSION_CHANNEL_NAME),
-                stream_description=_("Questions and discussion about using Zulip."),
+                debrand(str(Realm.ZULIP_DISCUSSION_CHANNEL_NAME)),
+                stream_description=debrand(_("Questions and discussion about using Zulip.")),
                 acting_user=None,
             )
         zulip_sandbox_channel = ensure_stream(
             realm,
             str(Realm.ZULIP_SANDBOX_CHANNEL_NAME),
-            stream_description=_("Experiment with Zulip here. :test_tube:"),
+            stream_description=debrand(_("Experiment with Zulip here. :test_tube:")),
             acting_user=None,
         )
         new_stream_announcements_stream = ensure_stream(

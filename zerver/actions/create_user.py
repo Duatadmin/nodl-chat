@@ -33,6 +33,7 @@ from zerver.lib.email_notifications import enqueue_welcome_emails, send_account_
 from zerver.lib.exceptions import JsonableError
 from zerver.lib.invites import notify_invites_changed
 from zerver.lib.mention import silent_mention_syntax_for_user
+from zerver.lib.nodl_branding import debrand
 from zerver.lib.remote_server import maybe_enqueue_audit_log_upload
 from zerver.lib.send_email import clear_scheduled_invitation_emails
 from zerver.lib.streams import can_access_stream_history
@@ -307,8 +308,10 @@ def process_new_human_user(
             internal_send_private_message(
                 get_system_bot(settings.NOTIFICATION_BOT, prereg_user.referred_by.realm_id),
                 prereg_user.referred_by,
-                _("{user} accepted your invitation to join Zulip!").format(
-                    user=silent_mention_syntax_for_user(user_profile)
+                debrand(
+                    _("{user} accepted your invitation to join Zulip!").format(
+                        user=silent_mention_syntax_for_user(user_profile)
+                    )
                 ),
             )
 

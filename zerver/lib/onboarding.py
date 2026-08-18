@@ -18,6 +18,7 @@ from zerver.actions.reactions import do_add_reaction
 from zerver.lib.emoji import get_emoji_data
 from zerver.lib.markdown.fenced_code import get_unused_fence
 from zerver.lib.message import SendMessageRequest, remove_single_newlines
+from zerver.lib.nodl_branding import debrand
 from zerver.models import Message, OnboardingUserMessage, Realm, UserProfile
 from zerver.models.groups import SystemGroups
 from zerver.models.recipients import Recipient
@@ -127,7 +128,12 @@ I've kicked off some conversations to help you get started. You can find
 them in your [Inbox](/#inbox).
 """)
 
-        navigation_tour_video_string = _("""
+        if settings.NODL_REBRAND_SYSTEM_MESSAGES:
+            # nodl fork: the navigation tour video is Zulip's web-app tour —
+            # wrong product for Nodle users, so drop that paragraph.
+            navigation_tour_video_string = ""
+        else:
+            navigation_tour_video_string = _("""
 You can always come back to the [Welcome to Zulip video]({navigation_tour_video_url}) for a quick app overview.
 """).format(navigation_tour_video_url=settings.NAVIGATION_TOUR_VIDEO_URL)
 
@@ -159,7 +165,7 @@ Hello, and welcome to Zulip!👋 {inform_about_tracked_onboarding_messages_text}
         internal_prep_private_message(
             get_system_bot(settings.WELCOME_BOT, user.realm_id),
             user,
-            remove_single_newlines(content),
+            debrand(remove_single_newlines(content)),
             # Note: Welcome bot doesn't trigger email/push notifications,
             # as this is intended to be seen contextually in the application.
             disable_external_notifications=True,
@@ -283,7 +289,7 @@ def send_welcome_bot_response(send_request: SendMessageRequest) -> None:
     else:
         assert send_request.message.recipient.type == Recipient.DIRECT_MESSAGE_GROUP
         conversation_recipient_id = send_request.message.recipient.id
-    content = select_welcome_bot_response(human_response_lower)
+    content = debrand(select_welcome_bot_response(human_response_lower))
     realm_id = send_request.realm.id
     commands = bot_commands()
     if (
@@ -337,8 +343,12 @@ def send_initial_realm_messages(
         channel_name_map = override_channel_name_map
     else:
         channel_name_map = {
-            OnboardingMessageTypeEnum.moving_messages: str(Realm.ZULIP_DISCUSSION_CHANNEL_NAME),
-            OnboardingMessageTypeEnum.welcome_to_zulip: str(Realm.ZULIP_DISCUSSION_CHANNEL_NAME),
+            OnboardingMessageTypeEnum.moving_messages: debrand(
+                str(Realm.ZULIP_DISCUSSION_CHANNEL_NAME)
+            ),
+            OnboardingMessageTypeEnum.welcome_to_zulip: debrand(
+                str(Realm.ZULIP_DISCUSSION_CHANNEL_NAME)
+            ),
             OnboardingMessageTypeEnum.start_conversation: str(Realm.ZULIP_SANDBOX_CHANNEL_NAME),
             OnboardingMessageTypeEnum.experiments: str(Realm.ZULIP_SANDBOX_CHANNEL_NAME),
             OnboardingMessageTypeEnum.greetings: str(Realm.DEFAULT_NOTIFICATION_STREAM_NAME),
@@ -542,8 +552,8 @@ This **greetings** topic is a great place to say “hi” :wave: to your teammat
             realm,
             welcome_bot,
             message["channel_name"],
-            message["topic_name"],
-            remove_single_newlines(message["content"]),
+            debrand(message["topic_name"]),
+            debrand(remove_single_newlines(message["content"])),
         )
         for message in welcome_messages
     ]

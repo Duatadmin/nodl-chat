@@ -306,3 +306,11 @@ VERIFY_WEBHOOK_SIGNATURES = False
 AUTH_LDAP_USER_ATTR_MAP = {
     "full_name": "cn",
 }
+
+# nodl: production disables the Zulip-branded update announcements; keep the
+# feature on in tests so the upstream test suite still exercises it.
+NODL_ENABLE_ZULIP_UPDATE_ANNOUNCEMENTS = True
+
+# nodl: production rebrands system-message copy Zulip→Nodle; keep it off in
+# tests, which assert the upstream copy verbatim.
+NODL_REBRAND_SYSTEM_MESSAGES = False

@@ -797,5 +797,17 @@ BACKEND_SERVICE_KEY: str | None = get_secret("backend_service_key")
 # (mirrors nodl-backend's meeting_audio_presigned_ttl_seconds).
 NODL_DERIVED_PRESIGN_TTL: int = int(os.environ.get("NODL_DERIVED_PRESIGN_TTL", "86400"))
 
+# Upstream's periodic "Zulip updates" feature announcements (23 heavily
+# Zulip-branded messages posted by Notification Bot after deploys) make no
+# sense in the Nodle product. Off in production; test settings enable it so
+# the upstream test suite keeps passing.
+NODL_ENABLE_ZULIP_UPDATE_ANNOUNCEMENTS = False
+
+# Rebrand system-generated message copy (Welcome Bot, Notification Bot,
+# onboarding channel names/content) from "Zulip" to "Nodle" after
+# translation — see zerver/lib/nodl_branding.py. Off in the test settings
+# so the upstream test suite (which asserts upstream copy) keeps passing.
+NODL_REBRAND_SYSTEM_MESSAGES = True
+
 # NODL MODIFICATION END
 ########################################################################
