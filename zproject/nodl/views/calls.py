@@ -89,6 +89,7 @@ def _run_call_setup(
     caller_avatar_url: str,
     *,
     caller_id: int | None = None,
+    caller_device_id: str | None = None,
 ) -> None:
     """Background half of call initiation: provision the LiveKit room, then
     push-notify the callee's devices.
@@ -137,6 +138,7 @@ def _run_call_setup(
         caller_name=caller_name,
         caller_avatar_url=caller_avatar_url,
         caller_id=caller_id,
+        caller_device_id=caller_device_id,
     )
 
 
@@ -148,12 +150,13 @@ def _start_call_setup_async(
     caller_avatar_url: str,
     *,
     caller_id: int | None = None,
+    caller_device_id: str | None = None,
 ) -> None:
     """Fire-and-forget wrapper: spawns _run_call_setup in a daemon thread."""
     thread = threading.Thread(
         target=_run_call_setup,
         args=(callee_id, call_id, room_name, caller_name, caller_avatar_url),
-        kwargs={"caller_id": caller_id},
+        kwargs={"caller_id": caller_id, "caller_device_id": caller_device_id},
         daemon=True,
     )
     thread.start()
@@ -324,6 +327,16 @@ def initiate_call(request: HttpRequest, user_profile: UserProfile) -> HttpRespon
 
     # Background: provision the LiveKit room, then push-notify the callee's
     # devices (Story 11.3).
+    # The initiating device's stable id (same value it registered its VoIP
+    # token under) — lets the ring fan-out skip exactly that device.
+    # Optional: older clients don't send it; then no exclusion applies.
+    raw_device_id = body.get("device_id")
+    caller_device_id: str | None = None
+    if isinstance(raw_device_id, str):
+        stripped_device_id = raw_device_id.strip()
+        if 0 < len(stripped_device_id) <= 255:
+            caller_device_id = stripped_device_id
+
     caller_name = user_profile.full_name or user_profile.delivery_email
     caller_avatar_url = ""
     _start_call_setup_async(
@@ -333,6 +346,7 @@ def initiate_call(request: HttpRequest, user_profile: UserProfile) -> HttpRespon
         caller_name=caller_name,
         caller_avatar_url=caller_avatar_url,
         caller_id=user_profile.id,
+        caller_device_id=caller_device_id,
     )
 
     return JsonResponse(

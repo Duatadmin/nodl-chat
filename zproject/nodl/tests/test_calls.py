@@ -230,6 +230,7 @@ class CallViewsTest(ZulipTestCase):
             caller_name=ANY,
             caller_avatar_url="",
             caller_id=self.caller.id,
+            caller_device_id=None,
         )
 
         call_id = data["call_id"]
@@ -913,6 +914,52 @@ class CallViewsTest(ZulipTestCase):
         self.assertEqual(result.status_code, 400)
         self.assertIn("integer", result.json()["msg"])
 
+    @patch.dict("os.environ", MOCK_LIVEKIT_ENV)
+    @patch("zproject.nodl.services.livekit_service.LIVEKIT_URL", MOCK_LIVEKIT_ENV["LIVEKIT_URL"])
+    @patch(
+        "zproject.nodl.services.livekit_service.LIVEKIT_API_KEY",
+        MOCK_LIVEKIT_ENV["LIVEKIT_API_KEY"],
+    )
+    @patch(
+        "zproject.nodl.services.livekit_service.LIVEKIT_API_SECRET",
+        MOCK_LIVEKIT_ENV["LIVEKIT_API_SECRET"],
+    )
+    def test_initiate_passes_device_id_to_call_setup(self) -> None:
+        """The initiating device's id reaches the ring fan-out so exactly
+        that device can be excluded."""
+        result = self.client_post(
+            "/nodl/calls/initiate",
+            json.dumps({"callee_id": self.callee.id, "device_id": "  caller-phone  "}),
+            content_type="application/json",
+            **self._auth_headers(self.caller),
+        )
+        self.assertEqual(result.status_code, 200)
+        self.assertEqual(
+            self.mock_call_setup.call_args.kwargs["caller_device_id"],
+            "caller-phone",
+        )
+
+    @patch.dict("os.environ", MOCK_LIVEKIT_ENV)
+    @patch("zproject.nodl.services.livekit_service.LIVEKIT_URL", MOCK_LIVEKIT_ENV["LIVEKIT_URL"])
+    @patch(
+        "zproject.nodl.services.livekit_service.LIVEKIT_API_KEY",
+        MOCK_LIVEKIT_ENV["LIVEKIT_API_KEY"],
+    )
+    @patch(
+        "zproject.nodl.services.livekit_service.LIVEKIT_API_SECRET",
+        MOCK_LIVEKIT_ENV["LIVEKIT_API_SECRET"],
+    )
+    def test_initiate_ignores_malformed_device_id(self) -> None:
+        """A non-string or oversized device_id is dropped, never an error."""
+        result = self.client_post(
+            "/nodl/calls/initiate",
+            json.dumps({"callee_id": self.callee.id, "device_id": ["not", "a", "str"]}),
+            content_type="application/json",
+            **self._auth_headers(self.caller),
+        )
+        self.assertEqual(result.status_code, 200)
+        self.assertIsNone(self.mock_call_setup.call_args.kwargs["caller_device_id"])
+
 
 class CallBusyAndSignalingTest(ZulipTestCase):
     """Busy rejection, stale-call self-healing, and lifecycle event pushes."""
@@ -1115,6 +1162,7 @@ class RunCallSetupTest(TestCase):
             caller_name="Hamlet",
             caller_avatar_url="",
             caller_id=3,
+            caller_device_id="caller-phone",
         )
         mock_create_room.assert_called_once_with(
             "call-x", max_participants=2, empty_timeout=35)
@@ -1125,6 +1173,7 @@ class RunCallSetupTest(TestCase):
             caller_name="Hamlet",
             caller_avatar_url="",
             caller_id=3,
+            caller_device_id="caller-phone",
         )
 
     @patch("zproject.nodl.views.calls.dispatch_call_push")
