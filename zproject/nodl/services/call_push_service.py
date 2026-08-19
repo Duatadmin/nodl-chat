@@ -322,6 +322,8 @@ def dispatch_call_push(
     room_name: str,
     caller_name: str,
     caller_avatar_url: str,
+    *,
+    caller_id: int | None = None,
 ) -> None:
     """Dispatch incoming call push notifications to ALL devices of the callee HUMAN.
 
@@ -332,6 +334,14 @@ def dispatch_call_push(
     The payload carries the callee profile's identity (recipient_user_id /
     realm URL / workspace id) so the app knows which local account must
     accept the call.
+
+    When *caller_id* is given, every token registered under the CALLER's
+    sibling profiles is excluded: a device with both the caller's and the
+    callee's accounts signed in registers the same physical token under
+    both, so without the exclusion the ring fan-out echoes the call back
+    to the device that just initiated it — the caller's phone rings with
+    their own call (and its busy guard can then kill the call for the
+    real callee devices).
 
     Queries DeviceVoipToken for active tokens, sends platform-appropriate
     push to each. For Android, if all DeviceVoipToken FCM sends fail,
@@ -397,6 +407,33 @@ def dispatch_call_push(
         any_android_success = False
         tried_voip_tokens: set[str] = set()
         tried_fcm_tokens: set[str] = set()
+
+        # Never ring a device the caller is signed in on: seed the tried
+        # sets with every token registered under the caller's sibling
+        # profiles, so those tokens are skipped in the loops below AND in
+        # the PushDeviceToken fallback.
+        if caller_id is not None:
+            caller_profile_ids = resolve_human_profile_ids(caller_id)
+            for row in DeviceVoipToken.objects.filter(
+                user_id__in=caller_profile_ids,
+                is_active=True,
+            ).values("voip_token", "fcm_token"):
+                if row["voip_token"]:
+                    tried_voip_tokens.add(row["voip_token"])
+                if row["fcm_token"]:
+                    tried_fcm_tokens.add(row["fcm_token"])
+            tried_fcm_tokens.update(
+                PushDeviceToken.objects.filter(
+                    user_id__in=caller_profile_ids,
+                    kind=PushDeviceToken.FCM,
+                ).values_list("token", flat=True)
+            )
+            if tried_voip_tokens or tried_fcm_tokens:
+                logger.info(
+                    "Call %s: excluding %d caller-registered token(s) from ring fan-out",
+                    call_id,
+                    len(tried_voip_tokens) + len(tried_fcm_tokens),
+                )
 
         for token_record in tokens:
             platform = token_record["platform"]
@@ -493,6 +530,8 @@ def dispatch_call_push_async(
     room_name: str,
     caller_name: str,
     caller_avatar_url: str,
+    *,
+    caller_id: int | None = None,
 ) -> None:
     """Fire-and-forget wrapper: spawns dispatch_call_push in a daemon thread.
 
@@ -502,6 +541,7 @@ def dispatch_call_push_async(
     thread = threading.Thread(
         target=dispatch_call_push,
         args=(callee_id, call_id, room_name, caller_name, caller_avatar_url),
+        kwargs={"caller_id": caller_id},
         daemon=True,
     )
     thread.start()

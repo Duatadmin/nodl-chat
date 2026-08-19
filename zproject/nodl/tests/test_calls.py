@@ -229,6 +229,7 @@ class CallViewsTest(ZulipTestCase):
             room_name=data["room_name"],
             caller_name=ANY,
             caller_avatar_url="",
+            caller_id=self.caller.id,
         )
 
         call_id = data["call_id"]
@@ -1113,6 +1114,7 @@ class RunCallSetupTest(TestCase):
             room_name="call-x",
             caller_name="Hamlet",
             caller_avatar_url="",
+            caller_id=3,
         )
         mock_create_room.assert_called_once_with(
             "call-x", max_participants=2, empty_timeout=35)
@@ -1122,6 +1124,7 @@ class RunCallSetupTest(TestCase):
             room_name="call-x",
             caller_name="Hamlet",
             caller_avatar_url="",
+            caller_id=3,
         )
 
     @patch("zproject.nodl.views.calls.dispatch_call_push")

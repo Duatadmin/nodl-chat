@@ -87,6 +87,8 @@ def _run_call_setup(
     room_name: str,
     caller_name: str,
     caller_avatar_url: str,
+    *,
+    caller_id: int | None = None,
 ) -> None:
     """Background half of call initiation: provision the LiveKit room, then
     push-notify the callee's devices.
@@ -134,6 +136,7 @@ def _run_call_setup(
         room_name=room_name,
         caller_name=caller_name,
         caller_avatar_url=caller_avatar_url,
+        caller_id=caller_id,
     )
 
 
@@ -143,11 +146,14 @@ def _start_call_setup_async(
     room_name: str,
     caller_name: str,
     caller_avatar_url: str,
+    *,
+    caller_id: int | None = None,
 ) -> None:
     """Fire-and-forget wrapper: spawns _run_call_setup in a daemon thread."""
     thread = threading.Thread(
         target=_run_call_setup,
         args=(callee_id, call_id, room_name, caller_name, caller_avatar_url),
+        kwargs={"caller_id": caller_id},
         daemon=True,
     )
     thread.start()
@@ -326,6 +332,7 @@ def initiate_call(request: HttpRequest, user_profile: UserProfile) -> HttpRespon
         room_name=room_name,
         caller_name=caller_name,
         caller_avatar_url=caller_avatar_url,
+        caller_id=user_profile.id,
     )
 
     return JsonResponse(

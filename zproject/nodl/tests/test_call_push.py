@@ -676,6 +676,137 @@ class DispatchCallPushFanOutTest(ZulipTestCase):
             PushDeviceToken.objects.filter(token="zulip-fcm-dead").count(), 0
         )
 
+    @patch("zproject.nodl.services.call_push_service.send_voip_push_ios")
+    @patch("zproject.nodl.services.call_push_service.send_fcm_call_data")
+    def test_caller_device_excluded_from_ring_fan_out(
+        self, mock_fcm: MagicMock, mock_ios: MagicMock
+    ) -> None:
+        """A device signed into BOTH the caller's and the callee's accounts
+        must not ring for the call it just initiated — but the callee's
+        other devices still do (founder repro: multi-login self-ring)."""
+        caller = self.example_user("hamlet")
+        # The shared phone registered its token under both accounts.
+        DeviceVoipToken.objects.create(
+            user=caller,
+            platform="ios",
+            device_id="shared-phone",
+            voip_token="apns-shared",
+        )
+        DeviceVoipToken.objects.create(
+            user=self.profile_a,
+            platform="ios",
+            device_id="shared-phone",
+            voip_token="apns-shared",
+        )
+        # The callee's own other device.
+        DeviceVoipToken.objects.create(
+            user=self.profile_a,
+            platform="ios",
+            device_id="own-phone",
+            voip_token="apns-own",
+        )
+
+        dispatch_call_push(
+            self.profile_a.id, self.call_id, self.room_name, "Caller", "",
+            caller_id=caller.id,
+        )
+
+        mock_ios.assert_called_once_with(
+            "apns-own", self.call_id, self.room_name, "Caller", "",
+            **default_recipient_kwargs(self.profile_a.id, str(self.ws_a)),
+        )
+
+    @patch("zproject.nodl.services.call_push_service.send_voip_push_ios")
+    @patch("zproject.nodl.services.call_push_service.send_fcm_call_data")
+    def test_caller_sibling_profile_tokens_also_excluded(
+        self, mock_fcm: MagicMock, mock_ios: MagicMock
+    ) -> None:
+        """The exclusion spans the caller HUMAN: a token the shared device
+        registered under the caller's other-workspace profile is excluded
+        too."""
+        caller_supabase_id = uuid.uuid4()
+        caller_a = self._make_mapped_profile(
+            self.realm_a, "caller-a@example.com", caller_supabase_id
+        )
+        caller_b = self._make_mapped_profile(
+            self.realm_b, "caller-b@example.com", caller_supabase_id
+        )
+        # Shared device: token registered under the caller's sibling profile
+        # and under the callee.
+        DeviceVoipToken.objects.create(
+            user=caller_b,
+            platform="android",
+            device_id="shared-pixel",
+            fcm_token="fcm-shared",
+        )
+        DeviceVoipToken.objects.create(
+            user=self.profile_a,
+            platform="android",
+            device_id="shared-pixel",
+            fcm_token="fcm-shared",
+        )
+        mock_fcm.return_value = "sent"
+
+        dispatch_call_push(
+            self.profile_a.id, self.call_id, self.room_name, "Caller", "",
+            caller_id=caller_a.id,
+        )
+
+        mock_fcm.assert_not_called()
+        mock_ios.assert_not_called()
+
+    @patch("zproject.nodl.services.call_push_service.send_voip_push_ios")
+    @patch("zproject.nodl.services.call_push_service.send_fcm_call_data")
+    def test_caller_exclusion_covers_push_device_token_fallback(
+        self, mock_fcm: MagicMock, mock_ios: MagicMock
+    ) -> None:
+        """The Android PushDeviceToken fallback must not resurrect a token
+        excluded as the caller's device."""
+        from zerver.models import PushDeviceToken
+
+        caller = self.example_user("hamlet")
+        DeviceVoipToken.objects.create(
+            user=caller,
+            platform="android",
+            device_id="shared-pixel",
+            fcm_token="fcm-shared",
+        )
+        PushDeviceToken.objects.create(
+            user=self.profile_a,
+            kind=PushDeviceToken.FCM,
+            token="fcm-shared",
+        )
+        mock_fcm.return_value = "sent"
+
+        dispatch_call_push(
+            self.profile_a.id, self.call_id, self.room_name, "Caller", "",
+            caller_id=caller.id,
+        )
+
+        mock_fcm.assert_not_called()
+
+    @patch("zproject.nodl.services.call_push_service.send_voip_push_ios")
+    @patch("zproject.nodl.services.call_push_service.send_fcm_call_data")
+    def test_without_caller_id_shared_token_still_rings(
+        self, mock_fcm: MagicMock, mock_ios: MagicMock
+    ) -> None:
+        """Legacy/other dispatch paths without caller context keep today's
+        behavior — exclusion only activates when the caller is known."""
+        caller = self.example_user("hamlet")
+        for user in (caller, self.profile_a):
+            DeviceVoipToken.objects.create(
+                user=user,
+                platform="ios",
+                device_id="shared-phone",
+                voip_token="apns-shared",
+            )
+
+        dispatch_call_push(
+            self.profile_a.id, self.call_id, self.room_name, "Caller", ""
+        )
+
+        self.assertEqual(mock_ios.call_count, 1)
+
     @patch("zproject.nodl.services.call_push_service.send_apns_call_event")
     @patch("zproject.nodl.services.call_push_service.send_fcm_call_event")
     def test_call_event_unregistered_fallback_token_row_deleted(
@@ -747,7 +878,7 @@ class DispatchCallPushAsyncTest(TestCase):
                 t.join(timeout=2)
 
         mock_dispatch.assert_called_once_with(
-            self.callee.id, call_id, room_name, "Caller", ""
+            self.callee.id, call_id, room_name, "Caller", "", caller_id=None
         )
 
 
