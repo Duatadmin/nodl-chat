@@ -1,7 +1,11 @@
 from typing import Any
 
 
-def serialize_call_record(call: Any, requesting_user_id: int | None = None) -> dict:
+def serialize_call_record(
+    call: Any,
+    requesting_user_id: int | None = None,
+    remote_nodl_user_id: str | None = None,
+) -> dict:
     """Serialize a CallRecord to a dict with snake_case JSON fields.
 
     When requesting_user_id is provided, derives remote_name, remote_avatar_url,
@@ -30,6 +34,8 @@ def serialize_call_record(call: Any, requesting_user_id: int | None = None) -> d
         "end_reason": call.end_reason,
         "remote_name": remote_name,
         "remote_avatar_url": None,
+        "remote_nodl_user_id": remote_nodl_user_id,
+        "remote_email": remote.delivery_email if remote else None,
         "is_incoming": is_incoming,
     }
 

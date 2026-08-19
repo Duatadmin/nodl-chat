@@ -1,12 +1,15 @@
 import base64
 import json
 import uuid
+from datetime import timedelta
 from unittest.mock import ANY, MagicMock, patch
+from urllib.parse import urlencode
 
 from django.db import IntegrityError
 from django.test import TestCase, override_settings
 from django.utils import timezone
 
+from nodl.extensions.mapping import record_realm_user_mapping
 from zerver.lib.test_classes import ZulipTestCase
 from zerver.models import UserProfile
 from zproject.nodl.models import CallRecord, DeviceVoipToken
@@ -249,6 +252,8 @@ class CallViewsTest(ZulipTestCase):
         self.assertIn("call_id", data)
         self.assertIn("room_name", data)
         self.assertIn("livekit_url", data)
+        self.assertEqual(data["caller_id"], self.caller.id)
+        self.assertEqual(data["callee_id"], self.callee.id)
 
         call.refresh_from_db()
         self.assertEqual(call.status, "connected")
@@ -518,6 +523,46 @@ class CallViewsTest(ZulipTestCase):
         self.assertEqual(data["result"], "success")
         self.assertIn("calls", data)
 
+    def test_history_cursor_does_not_skip_after_new_insertion(self) -> None:
+        base = timezone.now()
+        original = [
+            CallRecord.objects.create(
+                room_name=f"call-cursor-{i}",
+                caller=self.caller,
+                callee=self.callee,
+                status="ended",
+                initiated_at=base - timedelta(minutes=i),
+            )
+            for i in range(4)
+        ]
+        first = self.client_get(
+            "/nodl/calls/history?limit=2",
+            **self._auth_headers(self.caller),
+        ).json()["calls"]
+        self.assertEqual([row["call_id"] for row in first], [str(c.id) for c in original[:2]])
+
+        CallRecord.objects.create(
+            room_name="call-cursor-inserted",
+            caller=self.caller,
+            callee=self.callee,
+            status="ended",
+            initiated_at=base + timedelta(minutes=1),
+        )
+        query = urlencode(
+            {
+                "limit": 2,
+                "offset": 2,
+                "before_initiated_at": first[-1]["initiated_at"],
+                "before_call_id": first[-1]["call_id"],
+            }
+        )
+        second = self.client_get(
+            f"/nodl/calls/history?{query}",
+            **self._auth_headers(self.caller),
+        ).json()["calls"]
+
+        self.assertEqual([row["call_id"] for row in second], [str(c.id) for c in original[2:]])
+
     def test_history_shows_both_directions(self) -> None:
         """User sees calls where they are caller OR callee."""
         # Call where user is caller
@@ -541,6 +586,44 @@ class CallViewsTest(ZulipTestCase):
         )
         data = result.json()
         self.assertEqual(len(data["calls"]), 2)
+
+    def test_history_includes_remote_global_identity_and_email(self) -> None:
+        """History exposes identity hints without broadening realm auth."""
+        nodl_user_id = uuid.uuid4()
+        record_realm_user_mapping(self.callee.realm, self.callee, nodl_user_id)
+        CallRecord.objects.create(
+            room_name="call-identity",
+            caller=self.caller,
+            callee=self.callee,
+            status="ended",
+        )
+
+        result = self.client_get(
+            "/nodl/calls/history",
+            **self._auth_headers(self.caller),
+        )
+
+        self.assertEqual(result.status_code, 200)
+        call = result.json()["calls"][0]
+        self.assertEqual(call["remote_nodl_user_id"], str(nodl_user_id))
+        self.assertEqual(call["remote_email"], self.callee.delivery_email)
+
+    def test_history_identity_is_nullable_for_unmapped_profiles(self) -> None:
+        CallRecord.objects.create(
+            room_name="call-legacy-identity",
+            caller=self.caller,
+            callee=self.callee,
+            status="ended",
+        )
+
+        result = self.client_get(
+            "/nodl/calls/history",
+            **self._auth_headers(self.caller),
+        )
+
+        call = result.json()["calls"][0]
+        self.assertIsNone(call["remote_nodl_user_id"])
+        self.assertEqual(call["remote_email"], self.callee.delivery_email)
 
     # === Authorization ===
 

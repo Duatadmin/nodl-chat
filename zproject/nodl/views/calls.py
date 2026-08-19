@@ -10,8 +10,10 @@ from django.db import transaction
 from django.db.models import Q
 from django.http import HttpRequest, HttpResponse, JsonResponse
 from django.utils import timezone
+from django.utils.dateparse import parse_datetime
 from django.views.decorators.csrf import csrf_exempt
 
+from nodl.extensions.models import NodlRealmUserExtension
 from zerver.models import UserProfile
 from zproject.nodl.models import CallRecord
 from zproject.nodl.serializers.call_serializers import (
@@ -25,7 +27,6 @@ from zproject.nodl.services.call_push_service import (
     dispatch_call_event_push_async,
     dispatch_call_push,
 )
-from zproject.nodl.views.webhooks_livekit import insert_call_event_message
 from zproject.nodl.services.livekit_service import (
     CALL_ROOM_EMPTY_TIMEOUT,
     CALL_ROOM_MAX_PARTICIPANTS,
@@ -34,6 +35,7 @@ from zproject.nodl.services.livekit_service import (
     delete_room_async,
     generate_token,
 )
+from zproject.nodl.views.webhooks_livekit import insert_call_event_message
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +49,16 @@ STALE_RINGING_WINDOW = timedelta(seconds=45)
 # webhook path is the real cleanup; this only prevents a permanently-stuck
 # "busy" state.
 STALE_CONNECTED_WINDOW = timedelta(hours=24)
+
+
+def _nodl_user_ids_by_profile_id(profile_ids: set[int]) -> dict[int, str]:
+    """Resolve realm-local profiles to global nodl identities in one query."""
+    return {
+        profile_id: str(nodl_user_id)
+        for profile_id, nodl_user_id in NodlRealmUserExtension.objects.filter(
+            zulip_user_id__in=profile_ids
+        ).values_list("zulip_user_id", "supabase_user_id")
+    }
 
 
 def _expire_stale_calls(profile_ids: list[int]) -> None:
@@ -656,20 +668,62 @@ def call_history(request: HttpRequest, user_profile: UserProfile) -> HttpRespons
     limit = min(max(limit, 1), 100)
     offset = max(offset, 0)
 
-    calls = (
-        CallRecord.objects.filter(
-            Q(caller=user_profile) | Q(callee=user_profile)
-        )
-        .select_related("caller", "callee")
-        .order_by("-initiated_at")[offset : offset + limit]
+    before_initiated_at_raw = request.GET.get("before_initiated_at")
+    before_call_id_raw = request.GET.get("before_call_id")
+    before_initiated_at = None
+    before_call_id = None
+    if before_initiated_at_raw is not None or before_call_id_raw is not None:
+        if before_initiated_at_raw is None or before_call_id_raw is None:
+            return JsonResponse(
+                {
+                    "result": "error",
+                    "msg": "Both history cursor fields are required",
+                    "code": "BAD_REQUEST",
+                },
+                status=400,
+            )
+        before_initiated_at = parse_datetime(before_initiated_at_raw)
+        try:
+            before_call_id = uuid.UUID(before_call_id_raw)
+        except ValueError:
+            before_call_id = None
+        if before_initiated_at is None or before_call_id is None:
+            return JsonResponse(
+                {"result": "error", "msg": "Invalid history cursor", "code": "BAD_REQUEST"},
+                status=400,
+            )
+
+    calls_query = CallRecord.objects.filter(
+        Q(caller=user_profile) | Q(callee=user_profile)
     )
+    if before_initiated_at is not None and before_call_id is not None:
+        calls_query = calls_query.filter(
+            Q(initiated_at__lt=before_initiated_at)
+            | Q(initiated_at=before_initiated_at, id__lt=before_call_id)
+        )
+        offset = 0
+    calls = list(
+        calls_query.select_related("caller", "callee")
+        .order_by("-initiated_at", "-id")[offset : offset + limit]
+    )
+    remote_profile_ids = {
+        call.caller_id if call.callee_id == user_profile.id else call.callee_id
+        for call in calls
+    }
+    nodl_user_ids = _nodl_user_ids_by_profile_id(remote_profile_ids)
 
     return JsonResponse(
         {
             "result": "success",
             "msg": "",
             "calls": [
-                serialize_call_record(c, requesting_user_id=user_profile.id)
+                serialize_call_record(
+                    c,
+                    requesting_user_id=user_profile.id,
+                    remote_nodl_user_id=nodl_user_ids.get(
+                        c.caller_id if c.callee_id == user_profile.id else c.callee_id
+                    ),
+                )
                 for c in calls
             ],
         }
@@ -717,11 +771,20 @@ def call_detail(
             status=403,
         )
 
+    remote_profile_id = (
+        call.caller_id if call.callee_id == user_profile.id else call.callee_id
+    )
+    nodl_user_ids = _nodl_user_ids_by_profile_id({remote_profile_id})
+
     return JsonResponse(
         {
             "result": "success",
             "msg": "",
-            "call": serialize_call_record(call, requesting_user_id=user_profile.id),
+            "call": serialize_call_record(
+                call,
+                requesting_user_id=user_profile.id,
+                remote_nodl_user_id=nodl_user_ids.get(remote_profile_id),
+            ),
         }
     )
 
