@@ -1,7 +1,8 @@
 """Internal assistant API: task-stream reads and send-as-bot (Epic 2, Story 2.1).
 
 Service-authenticated endpoints consumed by nodl-backend's summarizer,
-Ask AI grounding, and task supervisor. Reads are pull-based and on-demand
+Ask AI grounding, task supervisor, and work verification (which reads the
+photos workers post in the task chat). Reads are pull-based and on-demand
 (AD-1) and must work on archived (deactivated) task streams — completed
 tasks have archived streams, and summarization order vs. archive order
 must never matter (AD-6).
@@ -18,8 +19,9 @@ import logging
 import uuid
 from typing import Any, cast
 
+from django.conf import settings
 from django.db import transaction
-from django.db.models import Max
+from django.db.models import Max, Q
 from django.http import HttpRequest, HttpResponse, JsonResponse
 from django.views.decorators.csrf import csrf_exempt
 from pydantic import BaseModel, ValidationError
@@ -34,6 +36,7 @@ from nodl.extensions.models import (
     NodlRealmUserExtension,
     NodlTaskStreamExtension,
 )
+from nodl.storage.presign import presign_attachment
 from zerver.actions.create_user import do_create_user
 from zerver.actions.message_edit import do_update_message
 from zerver.actions.message_send import check_send_message
@@ -41,14 +44,29 @@ from zerver.actions.streams import bulk_add_subscriptions
 from zerver.lib.exceptions import JsonableError
 from zerver.lib.markdown import render_message_markdown
 from zerver.lib.mention import MentionBackend, MentionData
+from zerver.lib.timestamp import datetime_to_timestamp
 from zerver.lib.types import StreamMessageEditRequest
-from zerver.models import Message, Realm, Subscription, UserProfile
+from zerver.models import Attachment, Message, Realm, Subscription, UserProfile
 from zerver.models.clients import get_client
 
 logger = logging.getLogger(__name__)
 
 ASSISTANT_BOT_NAME = "Nodle Assistant"
 MAX_MESSAGES_PER_PAGE = 500
+DEFAULT_ATTACHMENTS_PER_PAGE = 20
+MAX_ATTACHMENTS_PER_PAGE = 50
+
+# What counts as a photo for the attachments read. A typed upload is an image
+# when its content type says so; an untyped one (null on legacy rows, or the
+# generic octet-stream Zulip stores when neither the client nor the filename
+# names a type, e.g. HEIC) falls back to the file extension.
+_IMAGE_ATTACHMENT_FILTER = Q(attachment__content_type__istartswith="image/") | (
+    (
+        Q(attachment__content_type__isnull=True)
+        | Q(attachment__content_type__istartswith="application/octet-stream")
+    )
+    & Q(attachment__file_name__iregex=r"\.(jpe?g|png|webp|heic|heif)$")
+)
 
 
 class AssistantSendPayload(BaseModel):
@@ -123,6 +141,15 @@ def _get_task_stream_extension(
     return extension
 
 
+def _supabase_ids_by_zulip_id(zulip_user_ids: set[int]) -> dict[int, str]:
+    return {
+        zulip_user_id: str(supabase_user_id)
+        for zulip_user_id, supabase_user_id in NodlRealmUserExtension.objects.filter(
+            zulip_user_id__in=zulip_user_ids
+        ).values_list("zulip_user_id", "supabase_user_id")
+    }
+
+
 @csrf_exempt  # type: ignore[untyped-decorator]
 @require_service_auth  # type: ignore[untyped-decorator]
 def get_task_stream_messages(request: HttpRequest, task_id: uuid.UUID) -> HttpResponse:
@@ -184,13 +211,7 @@ def get_task_stream_messages(request: HttpRequest, task_id: uuid.UUID) -> HttpRe
     found_newest = len(page) <= num_after
     page = page[:num_after]
 
-    sender_ids = {message.sender_id for message in page}
-    supabase_by_zulip_id = {
-        zulip_user_id: str(supabase_user_id)
-        for zulip_user_id, supabase_user_id in NodlRealmUserExtension.objects.filter(
-            zulip_user_id__in=sender_ids
-        ).values_list("zulip_user_id", "supabase_user_id")
-    }
+    supabase_by_zulip_id = _supabase_ids_by_zulip_id({message.sender_id for message in page})
 
     messages = [
         {
@@ -223,6 +244,117 @@ def get_task_stream_messages(request: HttpRequest, task_id: uuid.UUID) -> HttpRe
             "latest_human_anchor": latest_human_anchor,
             "last_edit_time": last_edit_time.isoformat() if last_edit_time else None,
             "stream_archived": stream.deactivated,
+        },
+        status=200,
+    )
+
+
+@csrf_exempt  # type: ignore[untyped-decorator]
+@require_service_auth  # type: ignore[untyped-decorator]
+def get_task_stream_attachments(request: HttpRequest, task_id: uuid.UUID) -> HttpResponse:
+    """List the photos posted in a task stream after an anchor (work verification).
+
+    GET /api/v1/internal/task-streams/<task_id>/attachments
+        ?workspace_id=<uuid>&after_message_id=<message_id>&limit=<n>
+
+    Returns one row per (message, image attachment) for messages with
+    id > after_message_id, ascending by message id, each with a short-lived
+    presigned GET URL (null on local-uploads dev deployments) so nodl-backend
+    can download the bytes — /user_uploads/ is auth-proxied and not
+    backend-fetchable. Scoped through Attachment.messages to this stream's
+    messages only, so the service can never presign an arbitrary file.
+    Deleted messages are already gone from Message (Zulip archives them), and
+    their attachment links go with them.
+
+    Works on archived streams, like the messages read. `found_newest` is false
+    when more rows follow: resume with the last returned message_id.
+    """
+    if request.method != "GET":
+        return JsonResponse(
+            {"result": "error", "code": "METHOD_NOT_ALLOWED", "msg": "GET required"},
+            status=405,
+        )
+
+    workspace_id = request.GET.get("workspace_id", "")
+    try:
+        uuid.UUID(workspace_id)
+    except ValueError:
+        return JsonResponse(
+            {"result": "error", "code": "VALIDATION_ERROR", "msg": "Valid workspace_id required"},
+            status=400,
+        )
+
+    try:
+        after_message_id = int(request.GET.get("after_message_id", 0))
+        limit = int(request.GET.get("limit", DEFAULT_ATTACHMENTS_PER_PAGE))
+    except ValueError:
+        return JsonResponse(
+            {"result": "error", "code": "INVALID_PARAMS", "msg": "Invalid pagination parameters"},
+            status=400,
+        )
+    limit = min(max(1, limit), MAX_ATTACHMENTS_PER_PAGE)
+
+    extension = _get_task_stream_extension(task_id, workspace_id)
+    if extension is None:
+        return JsonResponse(
+            {"result": "error", "code": "TASK_STREAM_NOT_FOUND", "msg": "Task stream not found"},
+            status=404,
+        )
+
+    stream = extension.zulip_stream
+    links = list(
+        Attachment.messages.through.objects.filter(
+            message__realm_id=extension.zulip_realm_id,
+            message__recipient_id=stream.recipient_id,
+            message__id__gt=after_message_id,
+        )
+        .filter(_IMAGE_ATTACHMENT_FILTER)
+        .select_related("attachment", "message__sender")
+        .order_by("message_id", "attachment_id")[: limit + 1]
+    )
+    found_newest = len(links) <= limit
+    if not found_newest:
+        boundary_message_id = links[limit].message_id
+        links = links[:limit]
+        # Never split one message's photos across pages: the caller resumes
+        # after the last returned message_id and would skip the rest. (A
+        # single message with more photos than `limit` still has to split.)
+        whole_messages = [link for link in links if link.message_id != boundary_message_id]
+        if whole_messages:
+            links = whole_messages
+
+    supabase_by_zulip_id = _supabase_ids_by_zulip_id({link.message.sender_id for link in links})
+    can_presign = settings.LOCAL_UPLOADS_DIR is None
+
+    attachments = [
+        {
+            "message_id": link.message_id,
+            "timestamp": datetime_to_timestamp(link.message.date_sent),
+            "sender": {
+                "zulip_user_id": link.message.sender_id,
+                "supabase_user_id": supabase_by_zulip_id.get(link.message.sender_id),
+                "full_name": link.message.sender.full_name,
+                "is_bot": link.message.sender.is_bot,
+            },
+            "path_id": link.attachment.path_id,
+            "file_name": link.attachment.file_name,
+            "content_type": link.attachment.content_type,
+            "size": link.attachment.size,
+            "presigned_url": (
+                presign_attachment(link.attachment.path_id, settings.NODL_EVIDENCE_PRESIGN_TTL)
+                if can_presign
+                else None
+            ),
+        }
+        for link in links
+    ]
+
+    return JsonResponse(
+        {
+            "result": "success",
+            "stream_archived": stream.deactivated,
+            "found_newest": found_newest,
+            "attachments": attachments,
         },
         status=200,
     )

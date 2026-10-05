@@ -796,6 +796,9 @@ BACKEND_SERVICE_KEY: str | None = get_secret("backend_service_key")
 # Presigned R2 GET TTL for AssemblyAI pulls: 24h retry safety margin
 # (mirrors nodl-backend's meeting_audio_presigned_ttl_seconds).
 NODL_DERIVED_PRESIGN_TTL: int = int(os.environ.get("NODL_DERIVED_PRESIGN_TTL", "86400"))
+# Presigned R2 GET TTL for work-verification evidence: nodl-backend downloads
+# task-stream photos right after listing them, so 10 minutes is ample.
+NODL_EVIDENCE_PRESIGN_TTL: int = int(os.environ.get("NODL_EVIDENCE_PRESIGN_TTL", "600"))
 
 # Upstream's periodic "Zulip updates" feature announcements (23 heavily
 # Zulip-branded messages posted by Notification Bot after deploys) make no

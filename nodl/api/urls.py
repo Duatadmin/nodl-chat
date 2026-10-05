@@ -4,6 +4,7 @@ from django.urls import path
 
 from nodl.api.views import deactivate_realm, delete_user, sync_realm, sync_user
 from nodl.api.views.assistant import (
+    get_task_stream_attachments,
     get_task_stream_messages,
     send_assistant_message,
     update_assistant_card,
@@ -84,6 +85,11 @@ urlpatterns = [
         "api/v1/internal/task-streams/<uuid:task_id>/messages",
         get_task_stream_messages,
         name="nodl_assistant_task_stream_messages",
+    ),
+    path(
+        "api/v1/internal/task-streams/<uuid:task_id>/attachments",
+        get_task_stream_attachments,
+        name="nodl_assistant_task_stream_attachments",
     ),
     path(
         "api/v1/internal/messages/send",

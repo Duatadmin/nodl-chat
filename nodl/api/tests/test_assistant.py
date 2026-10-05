@@ -1,6 +1,9 @@
 """Unit tests for the internal assistant endpoints (Epic 2, Story 2.1).
 
-Also covers the work-verification card schemas.
+Also covers the work-verification additions: the task-stream attachments
+read and the verification card schemas. Scoping, the image filter and
+deletion run against real rows (the query is the thing under test);
+validation paths stay mocked.
 """
 
 import base64
@@ -10,10 +13,14 @@ from datetime import UTC, datetime
 from typing import Any
 from unittest.mock import MagicMock, patch
 
-from django.test import RequestFactory, TestCase
+from django.conf import settings
+from django.core.handlers.wsgi import WSGIRequest
+from django.test import RequestFactory, TestCase, override_settings
 from pydantic import ValidationError
 
 from nodl.api.views.assistant import (
+    ensure_assistant_bot,
+    get_task_stream_attachments,
     get_task_stream_messages,
     send_assistant_message,
 )
@@ -27,6 +34,21 @@ from nodl.api.views.card_schemas import (
     encode_card,
     validate_card_payload,
 )
+from nodl.extensions.models import (
+    NodlRealmExtension,
+    NodlRealmUserExtension,
+    NodlTaskStreamExtension,
+    SyncStatus,
+)
+from zerver.actions.create_realm import do_create_realm
+from zerver.actions.create_user import do_create_user
+from zerver.actions.message_delete import do_delete_messages
+from zerver.actions.message_send import check_send_message
+from zerver.actions.streams import bulk_add_subscriptions
+from zerver.lib.cache import bounce_key_prefix_for_testing
+from zerver.lib.streams import create_stream_if_needed
+from zerver.models import Attachment, Message, Realm, Stream, UserProfile
+from zerver.models.clients import get_client
 
 
 def _decode_card(content: str) -> dict[str, Any]:
@@ -534,3 +556,311 @@ class TestVerificationCardSchemas(TestCase):
             del payload[missing]
             with self.subTest(missing=missing), self.assertRaises(ValidationError):
                 validate_card_payload("verification_result", payload)
+
+
+class TestTaskStreamAttachmentsValidation(TestCase):
+    def setUp(self) -> None:
+        self.factory = RequestFactory()
+        self.task_id = uuid.uuid4()
+        self.workspace_id = str(uuid.uuid4())
+
+    def _request(self, query: str) -> WSGIRequest:
+        request = self.factory.get(
+            f"/api/v1/internal/task-streams/{self.task_id}/attachments?{query}"
+        )
+        request.is_service_request = True
+        return request
+
+    def test_requires_service_auth(self) -> None:
+        request = self.factory.get(f"/api/v1/internal/task-streams/{self.task_id}/attachments")
+        request.is_service_request = False
+
+        self.assertEqual(get_task_stream_attachments(request, self.task_id).status_code, 401)
+
+    def test_get_only(self) -> None:
+        request = self.factory.post(f"/api/v1/internal/task-streams/{self.task_id}/attachments")
+        request.is_service_request = True
+
+        self.assertEqual(get_task_stream_attachments(request, self.task_id).status_code, 405)
+
+    def test_workspace_id_must_be_a_uuid(self) -> None:
+        for query in ("", "workspace_id=", "workspace_id=not-a-uuid"):
+            with self.subTest(query=query):
+                response = get_task_stream_attachments(self._request(query), self.task_id)
+
+                self.assertEqual(response.status_code, 400)
+                self.assertEqual(json.loads(response.content)["code"], "VALIDATION_ERROR")
+
+    def test_bad_ints_are_400(self) -> None:
+        for query in ("after_message_id=abc", "limit=1.5"):
+            with self.subTest(query=query):
+                response = get_task_stream_attachments(
+                    self._request(f"workspace_id={self.workspace_id}&{query}"), self.task_id
+                )
+
+                self.assertEqual(response.status_code, 400)
+                self.assertEqual(json.loads(response.content)["code"], "INVALID_PARAMS")
+
+    @patch("nodl.api.views.assistant._get_task_stream_extension", return_value=None)
+    def test_unknown_task_is_404(self, _mock_ext: MagicMock) -> None:
+        response = get_task_stream_attachments(
+            self._request(f"workspace_id={self.workspace_id}"), self.task_id
+        )
+
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(json.loads(response.content)["code"], "TASK_STREAM_NOT_FOUND")
+
+
+class TaskStreamTestCase(TestCase):
+    """Real realm, users and private task stream, built the way task-stream sync does."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        # Per-test cache keys, as ZulipTestCase does: cached rows such as the
+        # sending Client must not outlive the transaction that created them.
+        bounce_key_prefix_for_testing(self.id())
+
+    def _make_realm(self) -> tuple[Realm, uuid.UUID]:
+        workspace_id = uuid.uuid4()
+        realm = do_create_realm(
+            string_id=str(workspace_id)[:20].lower(),
+            name="Evidence Test",
+            description="",
+            org_type=Realm.ORG_TYPES["business"]["id"],
+            create_zulip_discussion_channel=False,
+        )
+        NodlRealmExtension.objects.create(
+            zulip_realm=realm,
+            nodl_workspace_id=workspace_id,
+            sync_status=SyncStatus.SYNCED,
+        )
+        return realm, workspace_id
+
+    def _make_user(self, realm: Realm, full_name: str) -> tuple[UserProfile, uuid.UUID]:
+        user = do_create_user(
+            email=f"{uuid.uuid4().hex[:12]}@example.com",
+            password=None,
+            realm=realm,
+            full_name=full_name,
+            acting_user=None,
+        )
+        supabase_user_id = uuid.uuid4()
+        NodlRealmUserExtension.objects.create(
+            zulip_realm=realm, zulip_user=user, supabase_user_id=supabase_user_id
+        )
+        return user, supabase_user_id
+
+    def _make_task_stream(
+        self, realm: Realm, workspace_id: uuid.UUID, subscribers: list[UserProfile]
+    ) -> tuple[Stream, uuid.UUID]:
+        task_id = uuid.uuid4()
+        stream, _created = create_stream_if_needed(
+            realm,
+            f"task-{task_id}",
+            invite_only=True,
+            history_public_to_subscribers=False,
+            acting_user=None,
+        )
+        NodlTaskStreamExtension.objects.create(
+            zulip_realm=realm,
+            zulip_stream=stream,
+            nodl_workspace_id=workspace_id,
+            nodl_task_id=task_id,
+        )
+        bulk_add_subscriptions(
+            realm, [stream], subscribers, from_user_creation=True, acting_user=None
+        )
+        return stream, task_id
+
+    def _post(
+        self, sender: UserProfile, stream: Stream, files: list[tuple[str, str | None]]
+    ) -> int:
+        """Post a message linking freshly uploaded files; Zulip claims them on send."""
+        links = []
+        for file_name, content_type in files:
+            path_id = f"{sender.realm_id}/ab/{uuid.uuid4().hex[:24]}/{file_name}"
+            Attachment.objects.create(
+                file_name=file_name,
+                path_id=path_id,
+                owner=sender,
+                realm=sender.realm,
+                size=2048,
+                content_type=content_type,
+            )
+            links.append(f"[{file_name}](/user_uploads/{path_id})")
+        result = check_send_message(
+            sender=sender,
+            client=get_client("nodl-test"),
+            recipient_type_name="stream",
+            message_to=[stream.id],
+            topic_name="task",
+            message_content="\n".join(links) or "On it.",
+            realm=sender.realm,
+        )
+        return result.message_id
+
+
+class TestTaskStreamAttachments(TaskStreamTestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.factory = RequestFactory()
+        self.realm, self.workspace_id = self._make_realm()
+        self.worker, self.worker_supabase_id = self._make_user(self.realm, "Wayan Worker")
+        self.stream, self.task_id = self._make_task_stream(
+            self.realm, self.workspace_id, [self.worker]
+        )
+
+    def _get(self, **params: Any) -> dict[str, Any]:
+        query = "&".join(
+            f"{key}={value}" for key, value in {"workspace_id": self.workspace_id, **params}.items()
+        )
+        request = self.factory.get(
+            f"/api/v1/internal/task-streams/{self.task_id}/attachments?{query}"
+        )
+        request.is_service_request = True
+        response = get_task_stream_attachments(request, self.task_id)
+        self.assertEqual(response.status_code, 200, response.content)
+        data: dict[str, Any] = json.loads(response.content)
+        return data
+
+    def test_lists_photos_after_anchor_in_order_with_senders(self) -> None:
+        anchor = self._post(self.worker, self.stream, [("before.jpg", "image/jpeg")])
+        first = self._post(
+            self.worker, self.stream, [("wall.jpg", "image/jpeg"), ("spec.pdf", "application/pdf")]
+        )
+        self._post(self.worker, self.stream, [])  # text only
+        bot = ensure_assistant_bot(
+            self.realm, NodlRealmExtension.objects.get(zulip_realm=self.realm)
+        )
+        bulk_add_subscriptions(
+            self.realm, [self.stream], [bot], from_user_creation=True, acting_user=None
+        )
+        second = self._post(bot, self.stream, [("card.png", "image/png")])
+
+        data = self._get(after_message_id=anchor)
+
+        self.assertFalse(data["stream_archived"])
+        self.assertTrue(data["found_newest"])
+        rows = data["attachments"]
+        self.assertEqual(
+            [(row["message_id"], row["file_name"]) for row in rows],
+            [(first, "wall.jpg"), (second, "card.png")],
+        )
+        wall = rows[0]
+        message = Message.objects.get(id=first)
+        self.assertEqual(wall["timestamp"], int(message.date_sent.timestamp()))
+        self.assertEqual(
+            wall["sender"],
+            {
+                "zulip_user_id": self.worker.id,
+                "supabase_user_id": str(self.worker_supabase_id),
+                "full_name": "Wayan Worker",
+                "is_bot": False,
+            },
+        )
+        self.assertTrue(wall["path_id"].endswith("/wall.jpg"))
+        self.assertEqual(wall["content_type"], "image/jpeg")
+        self.assertEqual(wall["size"], 2048)
+        # Dev/test settings use local uploads: nothing to presign.
+        self.assertIsNotNone(settings.LOCAL_UPLOADS_DIR)
+        self.assertIsNone(wall["presigned_url"])
+        self.assertTrue(rows[1]["sender"]["is_bot"])
+        self.assertIsNone(rows[1]["sender"]["supabase_user_id"])
+
+    def test_image_filter_uses_type_then_extension_for_untyped_uploads(self) -> None:
+        self._post(
+            self.worker,
+            self.stream,
+            [
+                ("a.jpg", "image/jpeg"),
+                ("b.HEIC", "application/octet-stream"),
+                ("c.png", None),
+                ("d.webp", "image/webp"),
+                ("e.pdf", "application/pdf"),
+                ("f.txt", None),
+                ("g.bin", "application/octet-stream"),
+                ("h.jpg", "video/mp4"),  # a typed non-image is trusted over its name
+            ],
+        )
+
+        data = self._get()
+
+        self.assertEqual(
+            [row["file_name"] for row in data["attachments"]],
+            ["a.jpg", "b.HEIC", "c.png", "d.webp"],
+        )
+
+    def test_scoped_to_this_task_stream(self) -> None:
+        other_stream, _other_task = self._make_task_stream(
+            self.realm, self.workspace_id, [self.worker]
+        )
+        self._post(self.worker, other_stream, [("other.jpg", "image/jpeg")])
+        mine = self._post(self.worker, self.stream, [("mine.jpg", "image/jpeg")])
+
+        data = self._get()
+
+        self.assertEqual([row["message_id"] for row in data["attachments"]], [mine])
+
+    def test_deleted_message_photos_are_not_listed(self) -> None:
+        kept = self._post(self.worker, self.stream, [("kept.jpg", "image/jpeg")])
+        deleted = self._post(self.worker, self.stream, [("deleted.jpg", "image/jpeg")])
+        do_delete_messages(self.realm, [Message.objects.get(id=deleted)], acting_user=None)
+
+        data = self._get()
+
+        self.assertEqual([row["message_id"] for row in data["attachments"]], [kept])
+
+    def test_archived_stream_is_still_readable(self) -> None:
+        posted = self._post(self.worker, self.stream, [("done.jpg", "image/jpeg")])
+        self.stream.deactivated = True
+        self.stream.save(update_fields=["deactivated"])
+
+        data = self._get()
+
+        self.assertTrue(data["stream_archived"])
+        self.assertEqual([row["message_id"] for row in data["attachments"]], [posted])
+
+    def test_workspace_mismatch_is_404(self) -> None:
+        request = self.factory.get(
+            f"/api/v1/internal/task-streams/{self.task_id}/attachments?workspace_id={uuid.uuid4()}"
+        )
+        request.is_service_request = True
+
+        response = get_task_stream_attachments(request, self.task_id)
+
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(json.loads(response.content)["code"], "TASK_STREAM_NOT_FOUND")
+
+    def test_pages_never_split_a_message(self) -> None:
+        first = self._post(self.worker, self.stream, [("1a.jpg", None), ("1b.jpg", None)])
+        second = self._post(self.worker, self.stream, [("2a.jpg", None), ("2b.jpg", None)])
+
+        page = self._get(limit=3)
+
+        self.assertFalse(page["found_newest"])
+        self.assertEqual([row["message_id"] for row in page["attachments"]], [first, first])
+
+        rest = self._get(limit=3, after_message_id=first)
+
+        self.assertTrue(rest["found_newest"])
+        self.assertEqual([row["message_id"] for row in rest["attachments"]], [second, second])
+
+    def test_message_larger_than_limit_still_splits(self) -> None:
+        first = self._post(self.worker, self.stream, [("1a.jpg", None), ("1b.jpg", None)])
+
+        page = self._get(limit=1)
+
+        self.assertFalse(page["found_newest"])
+        self.assertEqual([row["message_id"] for row in page["attachments"]], [first])
+
+    @override_settings(LOCAL_UPLOADS_DIR=None)
+    @patch("nodl.api.views.assistant.presign_attachment", return_value="https://r2/signed")
+    def test_presigns_with_the_evidence_ttl_on_s3(self, mock_presign: MagicMock) -> None:
+        self._post(self.worker, self.stream, [("wall.jpg", "image/jpeg")])
+
+        data = self._get()
+
+        [row] = data["attachments"]
+        self.assertEqual(row["presigned_url"], "https://r2/signed")
+        mock_presign.assert_called_once_with(row["path_id"], settings.NODL_EVIDENCE_PRESIGN_TTL)
+        self.assertEqual(settings.NODL_EVIDENCE_PRESIGN_TTL, 600)
