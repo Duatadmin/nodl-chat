@@ -27,6 +27,7 @@ from nodl.extensions.models import (
     NodlRealmUserExtension,
     NodlUserExtension,
 )
+from nodl.storage.presign import presign_attachment
 from zerver.lib.queue import retry_event
 from zerver.models import Message
 from zerver.worker.base import QueueProcessingWorker, assign_queue
@@ -55,21 +56,6 @@ def _sender_nodl_user_id(message: Message) -> str | None:
             .first()
         )
     return str(supabase_id) if supabase_id else None
-
-
-def _presign_attachment(path_id: str) -> str:
-    """Mint a presigned GET URL for an R2/S3-stored attachment."""
-    from zerver.lib.upload.s3 import get_boto_client
-
-    return get_boto_client().generate_presigned_url(
-        ClientMethod="get_object",
-        Params={
-            "Bucket": settings.S3_AUTH_UPLOADS_BUCKET,
-            "Key": path_id,
-        },
-        ExpiresIn=settings.NODL_DERIVED_PRESIGN_TTL,
-        HttpMethod="GET",
-    )
 
 
 @assign_queue("nodl_derived_content")
@@ -120,7 +106,7 @@ class NodlDerivedContentWorker(QueueProcessingWorker):
             attachments = [
                 {
                     "path_id": path_id,
-                    "presigned_url": _presign_attachment(path_id),
+                    "presigned_url": presign_attachment(path_id, settings.NODL_DERIVED_PRESIGN_TTL),
                     "filename": path_id.rsplit("/", 1)[-1],
                     "mime": "audio/mp4",
                 }
