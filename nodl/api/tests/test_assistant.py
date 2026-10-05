@@ -1,9 +1,13 @@
-"""Unit tests for the internal assistant endpoints (Epic 2, Story 2.1)."""
+"""Unit tests for the internal assistant endpoints (Epic 2, Story 2.1).
+
+Also covers the work-verification card schemas.
+"""
 
 import base64
 import json
 import uuid
 from datetime import UTC, datetime
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 from django.test import RequestFactory, TestCase
@@ -14,12 +18,69 @@ from nodl.api.views.assistant import (
     send_assistant_message,
 )
 from nodl.api.views.card_schemas import (
+    CARD_SCHEMAS,
     NODL_CARD_PREFIX,
     UnknownCardTypeError,
+    VerificationRequestCard,
+    VerificationResultCard,
     build_card_message_content,
     encode_card,
     validate_card_payload,
 )
+
+
+def _decode_card(content: str) -> dict[str, Any]:
+    marker = content.split("\n", 1)[0]
+    b64 = marker[len(NODL_CARD_PREFIX) : -len(" -->")]
+    envelope: dict[str, Any] = json.loads(base64.urlsafe_b64decode(b64.encode("ascii")))
+    return envelope
+
+
+def _verification_request_payload(**overrides: Any) -> dict[str, Any]:
+    return {
+        "session_id": str(uuid.uuid4()),
+        "task_id": str(uuid.uuid4()),
+        "workspace_id": str(uuid.uuid4()),
+        "status": "collecting",
+        "shots": [
+            {"id": "s1", "kind": "overview", "instruction": "Whole wall, from the door"},
+        ],
+        **overrides,
+    }
+
+
+def _verification_result_payload(**overrides: Any) -> dict[str, Any]:
+    return {
+        "session_id": str(uuid.uuid4()),
+        "task_id": str(uuid.uuid4()),
+        "workspace_id": str(uuid.uuid4()),
+        "run_id": str(uuid.uuid4()),
+        "verdict": "PARTIAL",
+        "verdict_label": "Partly done",
+        "state": "awaiting_manager",
+        "routed_by": "ai_partial",
+        "checks": [
+            {
+                "id": "c1",
+                "question": "Are all tiles grouted?",
+                "severity": "major",
+                "status": "partly_seen",
+                "note": "Left corner not visible",
+                "photo_message_ids": [101, 102],
+            }
+        ],
+        "brief": {
+            "headline": "Grout mostly done",
+            "summary": "Two of three walls are grouted.",
+            "issues": ["Left corner not shown"],
+            "recommended_action": "ask_for_photo",
+            "prefill": {"ask_for_photo": "Photo of the left corner", "send_back_reason": None},
+            "in_person": [],
+            "plan_context": ["Waterproofing passed on 10-01"],
+        },
+        "submitted_by": str(uuid.uuid4()),
+        **overrides,
+    }
 
 
 class TestCardEncoding(TestCase):
@@ -386,3 +447,90 @@ class TestUpdateAssistantCard(TestCase):
         response = update_assistant_card(self._request(self.payload), 77)
 
         self.assertEqual(response.status_code, 403)
+
+
+class TestVerificationCardSchemas(TestCase):
+    def test_both_verification_cards_are_registered(self) -> None:
+        self.assertIs(CARD_SCHEMAS["verification_request"], VerificationRequestCard)
+        self.assertIs(CARD_SCHEMAS["verification_result"], VerificationResultCard)
+
+    def test_request_card_defaults_and_round_trip(self) -> None:
+        payload = _verification_request_payload(status="preparing", shots=[])
+
+        envelope = _decode_card(encode_card("verification_request", payload))
+
+        self.assertEqual(envelope["card_type"], "verification_request")
+        self.assertEqual(envelope["payload"]["shots"], [])
+        self.assertEqual(envelope["payload"]["requested_shots"], [])
+        self.assertFalse(envelope["payload"]["fallback_list"])
+        self.assertIsNone(envelope["payload"]["note"])
+
+    def test_request_card_keeps_nested_shots(self) -> None:
+        envelope = _decode_card(
+            encode_card("verification_request", _verification_request_payload())
+        )
+
+        self.assertEqual(
+            envelope["payload"]["shots"],
+            [{"id": "s1", "kind": "overview", "instruction": "Whole wall, from the door"}],
+        )
+
+    def test_request_card_rejects_unknown_status(self) -> None:
+        with self.assertRaises(ValidationError):
+            validate_card_payload(
+                "verification_request", _verification_request_payload(status="pending")
+            )
+
+    def test_request_card_requires_shots(self) -> None:
+        payload = _verification_request_payload()
+        del payload["shots"]
+
+        with self.assertRaises(ValidationError):
+            validate_card_payload("verification_request", payload)
+
+    def test_result_card_round_trips_nested_objects(self) -> None:
+        review = {
+            "decision": "request_more",
+            "by_user_id": str(uuid.uuid4()),
+            "at": "2026-10-05T12:00:00Z",
+            "comment": None,
+        }
+        payload = _verification_result_payload(review=review, photo_message_ids=[101, 102])
+
+        envelope = _decode_card(encode_card("verification_result", payload))
+
+        card = envelope["payload"]
+        self.assertEqual(card["checks"][0]["status"], "partly_seen")
+        self.assertEqual(card["checks"][0]["photo_message_ids"], [101, 102])
+        self.assertEqual(card["brief"]["prefill"]["ask_for_photo"], "Photo of the left corner")
+        self.assertIsNone(card["brief"]["prefill"]["send_back_reason"])
+        self.assertEqual(card["review"], review)
+        self.assertEqual(card["requested_shots"], [])
+        self.assertEqual(card["not_shown"], [])
+        self.assertEqual(card["reviewer_user_ids"], [])
+        self.assertIsNone(card["worker_comment"])
+
+    def test_result_card_allows_unavailable_ai(self) -> None:
+        payload = _verification_result_payload(
+            run_id=None, verdict=None, routed_by="ai_unavailable", checks=[]
+        )
+
+        card = validate_card_payload("verification_result", payload)
+
+        assert isinstance(card, VerificationResultCard)
+        self.assertIsNone(card.verdict)
+        self.assertIsNone(card.review)
+
+    def test_result_card_rejects_bad_check_status(self) -> None:
+        payload = _verification_result_payload()
+        payload["checks"][0]["status"] = "unclear"
+
+        with self.assertRaises(ValidationError):
+            validate_card_payload("verification_result", payload)
+
+    def test_result_card_requires_brief_and_nullable_fields(self) -> None:
+        for missing in ("brief", "run_id", "verdict", "routed_by", "submitted_by"):
+            payload = _verification_result_payload()
+            del payload[missing]
+            with self.subTest(missing=missing), self.assertRaises(ValidationError):
+                validate_card_payload("verification_result", payload)

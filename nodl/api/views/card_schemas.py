@@ -9,6 +9,16 @@ three escaping variants). Base64url survives every escaping layer intact.
 
 Unknown card types/versions must degrade to the markdown fallback on every
 consumer — never hard-fail rendering.
+
+Registered card types (``CARD_SCHEMAS``):
+
+- ``ask_ai_answer`` — Ask AI result in a task stream.
+- ``checkin`` — supervisor check-in with status buttons.
+- ``call_event`` — voice-call lifecycle event in a DM.
+- ``verification_request`` — work verification: the photo list a worker is
+  asked to post in the task chat, updated in place as the check progresses.
+- ``verification_result`` — work verification: one AI check run and the
+  manager's review of it.
 """
 
 import base64
@@ -71,10 +81,142 @@ class CallEventCard(BaseModel):
     duration_seconds: int | None = None
 
 
+class VerificationShot(BaseModel):
+    """One photo the worker is asked to take."""
+
+    id: str
+    kind: str
+    instruction: str
+
+
+class VerificationRequestCard(BaseModel):
+    """Work verification request, posted when a session opens.
+
+    Updated in place as the session moves on; `shots` is empty while the
+    photo list is still being prepared.
+    """
+
+    session_id: str
+    task_id: str
+    workspace_id: str
+    status: Literal[
+        "preparing",
+        "collecting",
+        "checking",
+        "not_passed",
+        "with_manager",
+        "approved",
+        "sent_back",
+        "closed",
+    ]
+    shots: list[VerificationShot]
+    # Extra photos the AI or the manager asked for.
+    requested_shots: list[str] = Field(default_factory=list)
+    # True when `shots` is the generic per-archetype list (scenario failed).
+    fallback_list: bool = False
+    note: str | None = None
+
+
+class VerificationCheck(BaseModel):
+    """One check question and what the AI saw for it."""
+
+    id: str
+    question: str
+    severity: str
+    status: Literal["pass", "partly_seen", "fail", "cannot_see"]
+    note: str
+    photo_message_ids: list[int]
+
+
+class VerificationBriefPrefill(BaseModel):
+    """Suggested text for the manager's ask-for-photo / send-back actions."""
+
+    ask_for_photo: str | None
+    send_back_reason: str | None
+
+
+class VerificationBrief(BaseModel):
+    """The manager's brief for one run."""
+
+    headline: str
+    summary: str
+    issues: list[str]
+    recommended_action: Literal[
+        "approve",
+        "approve_with_snag",
+        "send_back",
+        "ask_for_photo",
+        "check_in_person",
+        "review_photos",
+    ]
+    prefill: VerificationBriefPrefill
+    in_person: list[str]
+    plan_context: list[str]
+
+
+class VerificationReview(BaseModel):
+    """The manager's decision on a run."""
+
+    decision: Literal["approve", "reject", "request_more"]
+    by_user_id: str
+    at: str
+    comment: str | None
+
+
+class VerificationResultCard(BaseModel):
+    """Work verification result: one AI check run, then its review.
+
+    Posted as a new message for every run (so a mention can ping someone);
+    review actions update it in place.
+    """
+
+    session_id: str
+    task_id: str
+    workspace_id: str
+    run_id: str | None
+    # None when the AI check was unavailable.
+    verdict: (
+        Literal[
+            "PASS",
+            "PASS_WITH_NOTES",
+            "PARTIAL",
+            "FAIL",
+            "NEED_MORE_EVIDENCE",
+            "NOT_VERIFIABLE_FROM_PHOTO",
+        ]
+        | None
+    )
+    verdict_label: str
+    # Session state after this run.
+    state: str
+    routed_by: (
+        Literal[
+            "ai_pass",
+            "ai_partial",
+            "worker_override",
+            "not_photo_verifiable",
+            "ai_unavailable",
+        ]
+        | None
+    )
+    checks: list[VerificationCheck]
+    requested_shots: list[str] = Field(default_factory=list)
+    # Check questions no photo showed.
+    not_shown: list[str] = Field(default_factory=list)
+    brief: VerificationBrief
+    worker_comment: str | None = None
+    submitted_by: str
+    reviewer_user_ids: list[str] = Field(default_factory=list)
+    photo_message_ids: list[int] = Field(default_factory=list)
+    review: VerificationReview | None = None
+
+
 CARD_SCHEMAS: dict[str, type[BaseModel]] = {
     "ask_ai_answer": AskAiAnswerCard,
     "checkin": CheckinCard,
     "call_event": CallEventCard,
+    "verification_request": VerificationRequestCard,
+    "verification_result": VerificationResultCard,
 }
 
 
@@ -114,6 +256,8 @@ __all__ = [
     "AskAiAnswerCard",
     "CallEventCard",
     "CheckinCard",
+    "VerificationRequestCard",
+    "VerificationResultCard",
     "CARD_SCHEMAS",
     "UnknownCardTypeError",
     "ValidationError",
