@@ -152,8 +152,11 @@ class TestReadTaskStreamMessages(TestCase):
         )
         page_query.__getitem__.return_value = [human, bot]
         # AD-10: bot message id 12 is newest, but the human anchor stays at 10.
-        stream_messages.exclude.return_value.aggregate.return_value = {"id__max": 10}
-        stream_messages.aggregate.return_value = {"last_edit_time__max": None}
+        # Both aggregates run over human messages only (anchor, then edit time).
+        stream_messages.exclude.return_value.aggregate.side_effect = [
+            {"id__max": 10},
+            {"last_edit_time__max": None},
+        ]
         mock_realm_user_objects.filter.return_value.values_list.return_value = [(11, supabase_id)]
 
         response = get_task_stream_messages(
