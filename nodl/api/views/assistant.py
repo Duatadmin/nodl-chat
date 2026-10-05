@@ -76,6 +76,9 @@ class AssistantSendPayload(BaseModel):
     content: str
     card_type: str | None = None
     card_payload: dict[str, Any] | None = None
+    # Supabase user ids to @-mention (work verification pings the reviewer
+    # or the worker). Absent or empty leaves the message exactly as before.
+    mention_user_ids: list[str] | None = None
 
 
 class AssistantUpdateCardPayload(BaseModel):
@@ -148,6 +151,62 @@ def _supabase_ids_by_zulip_id(zulip_user_ids: set[int]) -> dict[int, str]:
             zulip_user_id__in=zulip_user_ids
         ).values_list("zulip_user_id", "supabase_user_id")
     }
+
+
+def _mention_syntax(user: UserProfile) -> str:
+    # The name-less `@**|id**` form for names that would break the `**`
+    # delimiters (Supabase-synced names skip Zulip's full-name validation).
+    if "*" in user.full_name:
+        return f"@**|{user.id}**"
+    return f"@**{user.full_name}|{user.id}**"
+
+
+def _resolve_mentions(
+    extension: NodlTaskStreamExtension, supabase_user_ids: list[str]
+) -> tuple[str, list[str]]:
+    """Resolve Supabase user ids to one mention line for a task stream.
+
+    Realm-scoped through NodlRealmUserExtension; only active users subscribed
+    to the stream qualify, since a mention of anyone else notifies no one.
+    Returns (mention_line, skipped_ids): the line is "" when nothing resolves,
+    and both keep the request order.
+    """
+    requested = list(dict.fromkeys(supabase_user_ids))
+    uuids: dict[str, uuid.UUID] = {}
+    for raw_id in requested:
+        try:
+            uuids[raw_id] = uuid.UUID(raw_id)
+        except ValueError:
+            continue
+
+    users_by_supabase_id = {
+        mapping.supabase_user_id: mapping.zulip_user
+        for mapping in NodlRealmUserExtension.objects.filter(
+            zulip_realm_id=extension.zulip_realm_id,
+            supabase_user_id__in=set(uuids.values()),
+            zulip_user__is_active=True,
+        ).select_related("zulip_user")
+    }
+    subscribed_user_ids = set(
+        Subscription.objects.filter(
+            recipient_id=extension.zulip_stream.recipient_id,
+            active=True,
+            user_profile_id__in=[user.id for user in users_by_supabase_id.values()],
+        ).values_list("user_profile_id", flat=True)
+    )
+
+    mentions: list[str] = []
+    mentioned_user_ids: set[int] = set()
+    skipped: list[str] = []
+    for raw_id in requested:
+        supabase_uuid = uuids.get(raw_id)
+        user = users_by_supabase_id.get(supabase_uuid) if supabase_uuid else None
+        if user is None or user.id not in subscribed_user_ids:
+            skipped.append(raw_id)
+        elif user.id not in mentioned_user_ids:
+            mentioned_user_ids.add(user.id)
+            mentions.append(_mention_syntax(user))
+    return " ".join(mentions), skipped
 
 
 @csrf_exempt  # type: ignore[untyped-decorator]
@@ -366,13 +425,20 @@ def send_assistant_message(request: HttpRequest) -> HttpResponse:
     """Post a message to a task stream as the realm's nodl Assistant bot.
 
     POST /api/v1/internal/messages/send
-    Body: {workspace_id, task_id, topic?, content, card_type?, card_payload?}
+    Body: {workspace_id, task_id, topic?, content, card_type?, card_payload?,
+           mention_user_ids?}
 
     `content` is the human-readable markdown; when `card_type`/`card_payload`
     are given the payload is schema-validated and embedded per AD-12 as
     `<!-- nodl-card:v1:{base64url-json} -->` ahead of the markdown fallback.
     Sends via check_send_message so the normal event queue delivers it to
     connected clients in real time.
+
+    `mention_user_ids` (Supabase ids) prepends one `@**Full Name|id**` line to
+    the markdown fallback — after the card marker, which stays first — so the
+    people named get Zulip's normal mention push. Ids that don't resolve to an
+    active subscriber of the stream are skipped and echoed back as
+    `skipped_mentions`. Without it, content and response are unchanged.
     """
     if request.method != "POST":
         return JsonResponse(
@@ -415,10 +481,17 @@ def send_assistant_message(request: HttpRequest) -> HttpResponse:
             status=409,
         )
 
+    fallback_markdown = payload.content
+    skipped_mentions: list[str] = []
+    if payload.mention_user_ids:
+        mention_line, skipped_mentions = _resolve_mentions(extension, payload.mention_user_ids)
+        if mention_line:
+            fallback_markdown = f"{mention_line}\n\n{fallback_markdown}"
+
     if payload.card_type is not None:
         try:
             content = build_card_message_content(
-                payload.card_type, payload.card_payload or {}, payload.content
+                payload.card_type, payload.card_payload or {}, fallback_markdown
             )
         except (UnknownCardTypeError, ValidationError) as exc:
             return JsonResponse(
@@ -426,7 +499,7 @@ def send_assistant_message(request: HttpRequest) -> HttpResponse:
                 status=400,
             )
     else:
-        content = payload.content
+        content = fallback_markdown
 
     try:
         realm = extension.zulip_realm
@@ -457,10 +530,10 @@ def send_assistant_message(request: HttpRequest) -> HttpResponse:
             message_content=content,
             realm=realm,
         )
-        return JsonResponse(
-            {"result": "success", "message_id": result.message_id},
-            status=200,
-        )
+        response: dict[str, Any] = {"result": "success", "message_id": result.message_id}
+        if payload.mention_user_ids:
+            response["skipped_mentions"] = skipped_mentions
+        return JsonResponse(response, status=200)
     except NodlRealmExtension.DoesNotExist:
         return JsonResponse(
             {"result": "error", "code": "REALM_NOT_FOUND", "msg": "Workspace realm not found"},

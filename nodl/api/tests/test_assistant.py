@@ -1,9 +1,9 @@
 """Unit tests for the internal assistant endpoints (Epic 2, Story 2.1).
 
 Also covers the work-verification additions: the task-stream attachments
-read and the verification card schemas. Scoping, the image filter and
-deletion run against real rows (the query is the thing under test);
-validation paths stay mocked.
+read, mentions on send, and the verification card schemas. Scoping, the
+image filter, deletion and mention resolution run against real rows (the
+query is the thing under test); validation paths stay mocked.
 """
 
 import base64
@@ -45,9 +45,10 @@ from zerver.actions.create_user import do_create_user
 from zerver.actions.message_delete import do_delete_messages
 from zerver.actions.message_send import check_send_message
 from zerver.actions.streams import bulk_add_subscriptions
+from zerver.actions.users import do_deactivate_user
 from zerver.lib.cache import bounce_key_prefix_for_testing
 from zerver.lib.streams import create_stream_if_needed
-from zerver.models import Attachment, Message, Realm, Stream, UserProfile
+from zerver.models import Attachment, Message, Realm, Stream, UserMessage, UserProfile
 from zerver.models.clients import get_client
 
 
@@ -864,3 +865,199 @@ class TestTaskStreamAttachments(TaskStreamTestCase):
         self.assertEqual(row["presigned_url"], "https://r2/signed")
         mock_presign.assert_called_once_with(row["path_id"], settings.NODL_EVIDENCE_PRESIGN_TTL)
         self.assertEqual(settings.NODL_EVIDENCE_PRESIGN_TTL, 600)
+
+
+class TestSendAssistantMessageMentionsUnchanged(TestCase):
+    """Without mention_user_ids the send path must be byte-identical (Ask AI, check-ins)."""
+
+    def setUp(self) -> None:
+        self.factory = RequestFactory()
+        self.task_id = str(uuid.uuid4())
+        self.card_payload = {
+            "task_id": self.task_id,
+            "mode": "assessment",
+            "answer": "On track.",
+        }
+
+    @patch("nodl.api.views.assistant._resolve_mentions")
+    @patch("nodl.api.views.assistant.get_client")
+    @patch("nodl.api.views.assistant.check_send_message")
+    @patch("nodl.api.views.assistant.Subscription.objects")
+    @patch("nodl.api.views.assistant.ensure_assistant_bot")
+    @patch("nodl.api.views.assistant.NodlRealmExtension.objects")
+    @patch("nodl.api.views.assistant._get_task_stream_extension")
+    def test_absent_or_empty_mentions_change_nothing(
+        self,
+        mock_get_extension: MagicMock,
+        _mock_realm_ext_objects: MagicMock,
+        _mock_ensure_bot: MagicMock,
+        mock_subscription_objects: MagicMock,
+        mock_send: MagicMock,
+        _mock_get_client: MagicMock,
+        mock_resolve: MagicMock,
+    ) -> None:
+        extension = MagicMock()
+        extension.zulip_stream = MagicMock(id=42, deactivated=False)
+        mock_get_extension.return_value = extension
+        mock_subscription_objects.filter.return_value.exists.return_value = True
+        mock_send.return_value = MagicMock(message_id=123)
+        expected_content = build_card_message_content(
+            "ask_ai_answer", self.card_payload, "Assessment: on track."
+        )
+
+        extras: list[dict[str, Any]] = [{}, {"mention_user_ids": None}, {"mention_user_ids": []}]
+        for extra in extras:
+            with self.subTest(extra=extra):
+                body = {
+                    "workspace_id": str(uuid.uuid4()),
+                    "task_id": self.task_id,
+                    "content": "Assessment: on track.",
+                    "card_type": "ask_ai_answer",
+                    "card_payload": self.card_payload,
+                    **extra,
+                }
+                request = self.factory.post(
+                    "/api/v1/internal/messages/send",
+                    data=json.dumps(body),
+                    content_type="application/json",
+                )
+                request.is_service_request = True
+
+                response = send_assistant_message(request)
+
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(
+                    json.loads(response.content), {"result": "success", "message_id": 123}
+                )
+                self.assertEqual(mock_send.call_args.kwargs["message_content"], expected_content)
+        mock_resolve.assert_not_called()
+
+
+class TestSendAssistantMessageMentions(TaskStreamTestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.factory = RequestFactory()
+        self.realm, self.workspace_id = self._make_realm()
+        self.manager, self.manager_supabase_id = self._make_user(self.realm, "Made Manager")
+        self.worker, self.worker_supabase_id = self._make_user(self.realm, "Wayan Worker")
+        self.stream, self.task_id = self._make_task_stream(
+            self.realm, self.workspace_id, [self.manager, self.worker]
+        )
+
+    def _send(self, **body: Any) -> dict[str, Any]:
+        request = self.factory.post(
+            "/api/v1/internal/messages/send",
+            data=json.dumps(
+                {"workspace_id": str(self.workspace_id), "task_id": str(self.task_id), **body}
+            ),
+            content_type="application/json",
+        )
+        request.is_service_request = True
+        response = send_assistant_message(request)
+        self.assertEqual(response.status_code, 200, response.content)
+        data: dict[str, Any] = json.loads(response.content)
+        return data
+
+    def _mentioned(self, user: UserProfile, message_id: int) -> bool:
+        return UserMessage.objects.filter(
+            user_profile=user,
+            message_id=message_id,
+            flags__andnz=UserMessage.flags.mentioned,
+        ).exists()
+
+    def test_mentions_follow_the_card_marker_and_ping(self) -> None:
+        outsider, outsider_supabase_id = self._make_user(self.realm, "Olly Outsider")
+        departed, departed_supabase_id = self._make_user(self.realm, "Dewi Departed")
+        bulk_add_subscriptions(
+            self.realm, [self.stream], [departed], from_user_creation=True, acting_user=None
+        )
+        do_deactivate_user(departed, acting_user=None)
+        other_realm, other_workspace_id = self._make_realm()
+        stranger, stranger_supabase_id = self._make_user(other_realm, "Sari Stranger")
+        # The manager is also a member of the other workspace: their profile
+        # there must not shadow the one in this realm.
+        manager_elsewhere = do_create_user(
+            email="manager-elsewhere@example.com",
+            password=None,
+            realm=other_realm,
+            full_name="Made Manager",
+            acting_user=None,
+        )
+        NodlRealmUserExtension.objects.create(
+            zulip_realm=other_realm,
+            zulip_user=manager_elsewhere,
+            supabase_user_id=self.manager_supabase_id,
+        )
+        self._make_task_stream(other_realm, other_workspace_id, [stranger, manager_elsewhere])
+        unknown = str(uuid.uuid4())
+        card_payload = _verification_request_payload(
+            task_id=str(self.task_id), workspace_id=str(self.workspace_id)
+        )
+
+        data = self._send(
+            content="Photos received: checking now.",
+            card_type="verification_request",
+            card_payload=card_payload,
+            mention_user_ids=[
+                str(self.manager_supabase_id),
+                "not-a-uuid",
+                str(outsider_supabase_id),
+                str(departed_supabase_id),
+                str(stranger_supabase_id),
+                unknown,
+                str(self.manager_supabase_id),
+                str(self.worker_supabase_id),
+            ],
+        )
+
+        self.assertEqual(
+            data["skipped_mentions"],
+            [
+                "not-a-uuid",
+                str(outsider_supabase_id),
+                str(departed_supabase_id),
+                str(stranger_supabase_id),
+                unknown,
+            ],
+        )
+        content = Message.objects.get(id=data["message_id"]).content
+        self.assertTrue(content.startswith(NODL_CARD_PREFIX))
+        self.assertEqual(_decode_card(content)["card_type"], "verification_request")
+        self.assertTrue(
+            content.endswith(
+                f"\n\n@**Made Manager|{self.manager.id}** @**Wayan Worker|{self.worker.id}**"
+                "\n\nPhotos received: checking now."
+            )
+        )
+        self.assertTrue(self._mentioned(self.manager, data["message_id"]))
+        self.assertTrue(self._mentioned(self.worker, data["message_id"]))
+        self.assertFalse(self._mentioned(outsider, data["message_id"]))
+
+    def test_mention_without_card(self) -> None:
+        data = self._send(content="Please check.", mention_user_ids=[str(self.manager_supabase_id)])
+
+        self.assertEqual(data["skipped_mentions"], [])
+        self.assertEqual(
+            Message.objects.get(id=data["message_id"]).content,
+            f"@**Made Manager|{self.manager.id}**\n\nPlease check.",
+        )
+
+    def test_name_with_asterisk_uses_id_only_syntax(self) -> None:
+        starred, starred_supabase_id = self._make_user(self.realm, "Putu *Site* Lead")
+        bulk_add_subscriptions(
+            self.realm, [self.stream], [starred], from_user_creation=True, acting_user=None
+        )
+
+        data = self._send(content="Please check.", mention_user_ids=[str(starred_supabase_id)])
+
+        content = Message.objects.get(id=data["message_id"]).content
+        self.assertEqual(content, f"@**|{starred.id}**\n\nPlease check.")
+        self.assertTrue(self._mentioned(starred, data["message_id"]))
+
+    def test_nothing_resolves_sends_content_unchanged(self) -> None:
+        unknown = str(uuid.uuid4())
+
+        data = self._send(content="Please check.", mention_user_ids=[unknown])
+
+        self.assertEqual(data["skipped_mentions"], [unknown])
+        self.assertEqual(Message.objects.get(id=data["message_id"]).content, "Please check.")
