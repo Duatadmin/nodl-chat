@@ -644,6 +644,27 @@ class TestVerificationCardSchemas(TestCase):
             with self.subTest(bad=bad), self.assertRaises(ValidationError):
                 validate_card_payload("verification_request", _verification_request_payload(**bad))
 
+    def test_a_non_latin_card_is_encoded_as_utf8(self) -> None:
+        note = "Крышка розетки отсутствует на второй розетке слева от двери"
+        payload = _verification_result_payload()
+        payload["checks"][0]["note"] = note
+
+        marker = encode_card("verification_result", payload)
+
+        self.assertTrue(marker.isascii())  # base64url either way
+        raw = base64.urlsafe_b64decode(marker[len(NODL_CARD_PREFIX) : -len(" -->")])
+        self.assertIn(note.encode(), raw)  # UTF-8, not \uXXXX escapes
+        self.assertEqual(_decode_card(marker)["payload"]["checks"][0]["note"], note)
+        escaped = json.dumps(
+            {
+                "card_type": "verification_result",
+                "payload": validate_card_payload("verification_result", payload).model_dump(),
+            },
+            separators=(",", ":"),
+            ensure_ascii=True,
+        )
+        self.assertLess(len(marker), len(base64.urlsafe_b64encode(escaped.encode())))
+
     def test_request_card_keeps_a_blocked_reason_added_later(self) -> None:
         payload = _verification_request_payload(blocked_reason="a_reason_added_later")
 
@@ -1339,6 +1360,39 @@ class TestSendAssistantMessageMentions(TaskStreamTestCase):
         self.assertEqual(truncate_content(push), (push, False))
         self.assertTrue(self._mentioned(self.manager, data["message_id"]))
         self.assertFalse(self._mentioned(self.worker, data["message_id"]))
+
+    def test_a_utf8_card_keeps_its_mention_flag_and_push(self) -> None:
+        """A card in a non-Latin workspace: the UTF-8 marker decodes on the
+        stored message, the mention line after it still pings, and the push
+        reads the text, then the name."""
+        from nodl.message_preview import message_preview_text
+
+        manager, manager_supabase_id = self._make_user(self.realm, "Иван Петров")
+        bulk_add_subscriptions(
+            self.realm, [self.stream], [manager], from_user_creation=True, acting_user=None
+        )
+        card_payload = _verification_result_payload(
+            task_id=str(self.task_id), workspace_id=str(self.workspace_id)
+        )
+        card_payload["checks"][0]["note"] = "Крышка розетки отсутствует на второй розетке"
+        data = self._send(
+            content="**Проверка фото** · Ждёт вас.\nПочти готово — одна крышка не установлена.",
+            card_type="verification_result",
+            card_payload=card_payload,
+            mention_user_ids=[str(manager_supabase_id)],
+        )
+
+        message = Message.objects.get(id=data["message_id"])
+        self.assertEqual(
+            _decode_card(message.content)["payload"]["checks"][0]["note"],
+            "Крышка розетки отсутствует на второй розетке",
+        )
+        self.assertTrue(self._mentioned(manager, data["message_id"]))
+        self.assertFalse(self._mentioned(self.worker, data["message_id"]))
+        self.assertEqual(
+            message_preview_text(message.rendered_content, message.content, message.id),
+            "Проверка фото · Ждёт вас. Почти готово — одна крышка не установлена. @Иван Петров",
+        )
 
     def test_a_long_push_is_cut_before_the_mention_never_after_the_status(self) -> None:
         from nodl.message_preview import message_preview_text

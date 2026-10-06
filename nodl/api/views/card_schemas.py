@@ -6,6 +6,10 @@ markdown fallback. Base64url is used deliberately: Zulip renders message
 content through markdown/HTML escaping, and raw JSON inside HTML comments
 proved escape-fragile (the legacy ``<!-- meeting:{json} -->`` parser needs
 three escaping variants). Base64url survives every escaping layer intact.
+The JSON is UTF-8 (not ASCII-escaped): a non-Latin character then costs
+about 2.7 of Zulip's 10,000 message characters instead of 8. Every reader
+decodes base64url → UTF-8 → JSON (mobile ``utf8.decode``, web
+``TextDecoder``).
 
 Unknown card types/versions must degrade to the markdown fallback on every
 consumer — never hard-fail rendering.
@@ -349,7 +353,7 @@ def encode_card(card_type: str, payload: dict[str, Any]) -> str:
     """Encode a validated card payload as a nodl-card:v1 HTML comment."""
     validated = validate_card_payload(card_type, payload)
     envelope = {"card_type": card_type, "payload": validated.model_dump()}
-    raw = json.dumps(envelope, separators=(",", ":"), ensure_ascii=True)
+    raw = json.dumps(envelope, separators=(",", ":"), ensure_ascii=False)
     encoded = base64.urlsafe_b64encode(raw.encode("utf-8")).decode("ascii")
     return f"{NODL_CARD_PREFIX}{encoded}{NODL_CARD_SUFFIX}"
 
