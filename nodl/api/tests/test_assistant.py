@@ -580,10 +580,17 @@ class TestVerificationCardSchemas(TestCase):
                 {
                     "text": "Close-up of socket 3",
                     "by": "manager",
+                    "by_user_id": "u-mgr",
                     "by_name": "Dana Novak",
                     "kind": "photo",
                 },
-                {"text": "The signed test sheet", "by": "ai", "by_name": None, "kind": "document"},
+                {
+                    "text": "The signed test sheet",
+                    "by": "ai",
+                    "by_user_id": None,
+                    "by_name": None,
+                    "kind": "document",
+                },
             ],
             fallback_list=False,
             note="Dana asked for another photo: post it here, then tap Check my photos.",
@@ -631,7 +638,13 @@ class TestVerificationCardSchemas(TestCase):
                 }
             ],
             requested_shots=[
-                {"text": "The left corner", "by": "ai", "by_name": None, "kind": "photo"}
+                {
+                    "text": "The left corner",
+                    "by": "ai",
+                    "by_user_id": None,
+                    "by_name": None,
+                    "kind": "photo",
+                }
             ],
             not_shown=["Are all tiles grouted?"],
             brief={

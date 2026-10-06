@@ -107,6 +107,8 @@ class VerificationRequestedShot(BaseModel):
 
     text: str
     by: Literal["ai", "manager"]
+    # The manager who asked (None for the AI): clients say "you" to them.
+    by_user_id: str | None = None
     by_name: str | None = None
     # "document" when the task can't be shown in photos (proof is asked for).
     kind: Literal["photo", "document"] = "photo"
