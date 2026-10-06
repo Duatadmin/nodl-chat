@@ -146,6 +146,10 @@ class VerificationRequestCard(BaseModel):
     photos_after_message_id: int | None = None
     # The result card that shows where the check stands.
     result_message_id: int | None = None
+    # Why a closed check closed: "closed_without_review", "task_archived",
+    # "task_deleted" or "expired" (clients word it per language). A plain
+    # string, so a reason added later never fails a card update.
+    closed_reason: str | None = None
 
 
 class VerificationCheck(BaseModel):

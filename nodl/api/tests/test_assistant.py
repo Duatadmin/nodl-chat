@@ -590,11 +590,21 @@ class TestVerificationCardSchemas(TestCase):
             blocked_reason="no_new_photo",
             photos_after_message_id=640,
             result_message_id=612,
+            closed_reason=None,
         )
 
         self.assertEqual(
             _decode_card(encode_card("verification_request", payload))["payload"], payload
         )
+
+    def test_request_card_keeps_why_a_check_closed(self) -> None:
+        payload = _verification_request_payload(
+            status="closed", closed_reason="closed_without_review"
+        )
+
+        card = _decode_card(encode_card("verification_request", payload))["payload"]
+
+        self.assertEqual(card["closed_reason"], "closed_without_review")
 
     def test_request_card_v2_rejects_old_and_unknown_shapes(self) -> None:
         for bad in (
