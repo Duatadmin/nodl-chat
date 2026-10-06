@@ -90,6 +90,23 @@ class AssistantUpdateCardPayload(BaseModel):
     card_payload: dict[str, Any]
 
 
+def _too_large(content: str, *, card: bool) -> JsonResponse | None:
+    """A 413 for content over Zulip's MAX_MESSAGE_LENGTH: Zulip would cut it
+    (a card then no longer decodes and its mention can be lost) and still
+    report success. The caller keeps the message owed instead."""
+    limit = settings.MAX_MESSAGE_LENGTH
+    if len(content) <= limit:
+        return None
+    return JsonResponse(
+        {
+            "result": "error",
+            "code": "CARD_TOO_LARGE" if card else "MESSAGE_TOO_LARGE",
+            "msg": f"Content is {len(content)} characters; the limit is {limit}",
+        },
+        status=413,
+    )
+
+
 def _assistant_bot_email(realm: Realm) -> str:
     return f"assistant-bot@{realm.string_id}.nodl.internal"
 
@@ -435,13 +452,19 @@ def send_assistant_message(request: HttpRequest) -> HttpResponse:
     Sends via check_send_message so the normal event queue delivers it to
     connected clients in real time.
 
-    `mention_user_ids` (Supabase ids) appends one `@**Full Name|id**` line to
-    the markdown fallback, so the people named get Zulip's normal mention
-    push (the mention flag comes from the rendered content, wherever the
-    mention sits). It goes last so the push text — the flattened fallback —
-    opens with what happened, not with names. Ids that don't resolve to an
-    active subscriber of the stream are skipped and echoed back as
-    `skipped_mentions`. Without it, content and response are unchanged.
+    `mention_user_ids` (Supabase ids) adds one `@**Full Name|id**` line, so
+    the people named get Zulip's normal mention push (the mention flag comes
+    from the rendered content, wherever the mention sits). On a card it goes
+    right after the card marker, ahead of the fallback, so nothing that cuts
+    a message can cut the mention; the push text still opens with what
+    happened (`message_preview_text` moves it to the end). On a plain message
+    it goes last. Ids that don't resolve to an active subscriber of the
+    stream are skipped and echoed back as `skipped_mentions`. Without it,
+    content and response are unchanged.
+
+    Content over Zulip's MAX_MESSAGE_LENGTH is refused (413 CARD_TOO_LARGE /
+    MESSAGE_TOO_LARGE) instead of being silently truncated, which would break
+    the card and cut the mention.
     """
     if request.method != "POST":
         return JsonResponse(
@@ -484,17 +507,16 @@ def send_assistant_message(request: HttpRequest) -> HttpResponse:
             status=409,
         )
 
-    fallback_markdown = payload.content
+    mention_line = ""
     skipped_mentions: list[str] = []
     if payload.mention_user_ids:
         mention_line, skipped_mentions = _resolve_mentions(extension, payload.mention_user_ids)
-        if mention_line:
-            fallback_markdown = f"{fallback_markdown}\n\n{mention_line}"
 
     if payload.card_type is not None:
+        body = f"{mention_line}\n\n{payload.content}" if mention_line else payload.content
         try:
             content = build_card_message_content(
-                payload.card_type, payload.card_payload or {}, fallback_markdown
+                payload.card_type, payload.card_payload or {}, body
             )
         except (UnknownCardTypeError, ValidationError) as exc:
             return JsonResponse(
@@ -502,7 +524,10 @@ def send_assistant_message(request: HttpRequest) -> HttpResponse:
                 status=400,
             )
     else:
-        content = fallback_markdown
+        content = f"{payload.content}\n\n{mention_line}" if mention_line else payload.content
+    too_large = _too_large(content, card=payload.card_type is not None)
+    if too_large is not None:
+        return too_large
 
     try:
         realm = extension.zulip_realm
@@ -567,7 +592,8 @@ def update_assistant_card(request: HttpRequest, message_id: int) -> HttpResponse
     backend rewrites the original card payload (status=responded) so every
     client renders the answered state after reload — not just the local
     component that clicked the button. Only messages sent by the realm's
-    assistant bot in the task's own stream can be updated.
+    assistant bot in the task's own stream can be updated. Content over
+    Zulip's MAX_MESSAGE_LENGTH is refused (413 CARD_TOO_LARGE), as on send.
     """
     if request.method != "POST":
         return JsonResponse(
@@ -612,6 +638,9 @@ def update_assistant_card(request: HttpRequest, message_id: int) -> HttpResponse
             {"result": "error", "code": "INVALID_CARD", "msg": str(exc)},
             status=400,
         )
+    too_large = _too_large(content, card=True)
+    if too_large is not None:
+        return too_large
 
     try:
         realm = extension.zulip_realm

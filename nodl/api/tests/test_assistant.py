@@ -441,6 +441,24 @@ class TestUpdateAssistantCard(TestCase):
         self.assertIn("**Check-in**: answered", sent_content)
         self.assertEqual(mock_update.call_args.kwargs["user_profile"], bot)
 
+    @patch("nodl.api.views.assistant.do_update_message")
+    @patch("nodl.api.views.assistant._get_task_stream_extension")
+    def test_content_over_zulips_limit_is_refused(
+        self, mock_get_extension: MagicMock, mock_update: MagicMock
+    ) -> None:
+        from django.conf import settings
+
+        from nodl.api.views.assistant import update_assistant_card
+
+        mock_get_extension.return_value = MagicMock()
+        payload = {**self.payload, "content": "z" * settings.MAX_MESSAGE_LENGTH}
+
+        response = update_assistant_card(self._request(payload), 77)
+
+        self.assertEqual(response.status_code, 413, response.content)
+        self.assertEqual(json.loads(response.content)["code"], "CARD_TOO_LARGE")
+        mock_update.assert_not_called()
+
     @patch("nodl.api.views.assistant.transaction.atomic")
     @patch("nodl.api.views.assistant.NodlRealmExtension.objects")
     @patch("nodl.api.views.assistant.ensure_assistant_bot")
@@ -1211,13 +1229,15 @@ class TestSendAssistantMessageMentions(TaskStreamTestCase):
         content = Message.objects.get(id=data["message_id"]).content
         self.assertTrue(content.startswith(NODL_CARD_PREFIX))
         self.assertEqual(_decode_card(content)["card_type"], "verification_request")
-        # The mention line goes last: the push opens with what happened.
-        self.assertTrue(
-            content.endswith(
-                "\n\nPhotos received: checking now."
-                f"\n\n@**Made Manager|{self.manager.id}** @**Wayan Worker|{self.worker.id}**"
-            )
+        # The mention line follows the marker, ahead of the fallback: nothing
+        # that cuts a message can cut it (the push text moves it last).
+        marker, mention_line, fallback = content.split("\n\n")
+        self.assertTrue(marker.endswith(" -->"))
+        self.assertEqual(
+            mention_line,
+            f"@**Made Manager|{self.manager.id}** @**Wayan Worker|{self.worker.id}**",
         )
+        self.assertEqual(fallback, "Photos received: checking now.")
         self.assertTrue(self._mentioned(self.manager, data["message_id"]))
         self.assertTrue(self._mentioned(self.worker, data["message_id"]))
         self.assertFalse(self._mentioned(outsider, data["message_id"]))
@@ -1231,6 +1251,40 @@ class TestSendAssistantMessageMentions(TaskStreamTestCase):
             f"Please check.\n\n@**Made Manager|{self.manager.id}**",
         )
         self.assertTrue(self._mentioned(self.manager, data["message_id"]))
+
+    def test_content_over_zulips_limit_is_refused_not_truncated(self) -> None:
+        from django.conf import settings
+
+        before = Message.objects.count()
+        card_payload = _verification_result_payload(
+            task_id=str(self.task_id), workspace_id=str(self.workspace_id)
+        )
+        card_payload["brief"]["summary"] = "x" * settings.MAX_MESSAGE_LENGTH
+        for body, code in (
+            ({"card_type": "verification_result", "card_payload": card_payload}, "CARD_TOO_LARGE"),
+            ({"content": "y" * (settings.MAX_MESSAGE_LENGTH + 1)}, "MESSAGE_TOO_LARGE"),
+        ):
+            with self.subTest(code=code):
+                request = self.factory.post(
+                    "/api/v1/internal/messages/send",
+                    data=json.dumps(
+                        {
+                            "workspace_id": str(self.workspace_id),
+                            "task_id": str(self.task_id),
+                            "content": "**Photo check** · Waiting for you.",
+                            "mention_user_ids": [str(self.manager_supabase_id)],
+                            **body,
+                        }
+                    ),
+                    content_type="application/json",
+                )
+                request.is_service_request = True
+
+                response = send_assistant_message(request)
+
+                self.assertEqual(response.status_code, 413, response.content)
+                self.assertEqual(json.loads(response.content)["code"], code)
+        self.assertEqual(Message.objects.count(), before)
 
     def test_name_with_asterisk_uses_id_only_syntax(self) -> None:
         starred, starred_supabase_id = self._make_user(self.realm, "Putu *Site* Lead")

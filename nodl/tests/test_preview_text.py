@@ -12,7 +12,12 @@ run under the plain-pytest CI job. Fixtures mirror the REAL rendered shapes:
 
 import unittest
 
-from nodl.preview_text import split_inline_images, strip_marker_text, strip_nodl_markers
+from nodl.preview_text import (
+    defer_leading_mentions,
+    split_inline_images,
+    strip_marker_text,
+    strip_nodl_markers,
+)
 
 FILE_CARD_HTML = (
     '<p><a href="/user_uploads/2/ab/T/test-letter.docx">test-letter.docx</a></p>\n'
@@ -155,3 +160,38 @@ class StripMarkerTextTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+MENTIONS_P = (
+    '<p><span class="user-mention" data-user-id="7">@Made Manager</span> '
+    '<span class="user-mention" data-user-id="8">@Wayan Worker</span></p>'
+)
+CARD_TEXT_P = "<p><strong>Photo check</strong> · Waiting for you.<br>\nLooks done.</p>"
+
+
+class DeferLeadingMentionsTest(unittest.TestCase):
+    def test_a_leading_paragraph_of_mentions_moves_to_the_end(self) -> None:
+        moved = defer_leading_mentions(f"\n{MENTIONS_P}\n{CARD_TEXT_P}")
+        self.assertEqual(
+            _text_of(moved),
+            "Photo check · Waiting for you. Looks done. @Made Manager @Wayan Worker",
+        )
+
+    def test_the_empty_paragraph_a_stripped_marker_leaves_is_skipped(self) -> None:
+        # Zulip renders the card marker as escaped text in a paragraph; once
+        # stripped, an empty paragraph leads.
+        moved = defer_leading_mentions(f"<p></p>\n{MENTIONS_P}\n{CARD_TEXT_P}")
+        self.assertEqual(
+            _text_of(moved),
+            "Photo check · Waiting for you. Looks done. @Made Manager @Wayan Worker",
+        )
+
+    def test_anything_else_is_left_alone(self) -> None:
+        for html in (
+            f"{CARD_TEXT_P}\n{MENTIONS_P}",  # already last
+            '<p>Hi <span class="user-mention">@Made</span></p>\n<p>more</p>',  # text too
+            MENTIONS_P,  # nothing to move it after
+            "<p><strong>@Made</strong></p>\n<p>more</p>",  # not a mention
+        ):
+            with self.subTest(html=html):
+                self.assertEqual(defer_leading_mentions(html), html)

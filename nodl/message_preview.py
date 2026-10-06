@@ -35,6 +35,7 @@ def message_preview_text(
     """Flatten a message to preview text, matching how clients render it."""
     # Local imports: see module docstring.
     from nodl.preview_text import (
+        defer_leading_mentions,
         split_inline_images,
         strip_marker_text,
         strip_nodl_markers,
@@ -46,6 +47,10 @@ def message_preview_text(
     if rendered_content:
         try:
             cleaned = strip_nodl_markers(rendered_content)
+            if "nodl-card:v1:" in rendered_content:
+                # An assistant card's mention line follows its marker (so no
+                # cut can lose it); the push still opens with the card's text.
+                cleaned = defer_leading_mentions(cleaned)
             # Photos flatten to nothing useful (empty img alt) or worse — the
             # raw upload filename from the link paragraph. Split them out and
             # label below, mirroring the clients' typed classifier.

@@ -111,3 +111,33 @@ class MessagePreviewTextTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CardMentionOrderTest(unittest.TestCase):
+    """A card's mention line follows its marker; the preview ends with it."""
+
+    def setUp(self) -> None:
+        self._saved = _install_zerver_stub()
+        self.addCleanup(_restore_modules, self._saved)
+
+    def _preview(self, rendered: str) -> str:
+        from nodl.message_preview import message_preview_text
+
+        return message_preview_text(rendered, "raw", 1)
+
+    def test_a_cards_leading_mention_line_reads_last(self) -> None:
+        rendered = (
+            "<!-- nodl-card:v1:eyJjYXJkX3R5cGUiOiJhaSJ9 -->\n"
+            '<p><span class="user-mention" data-user-id="7">@Made Manager</span></p>\n'
+            "<p><strong>Photo check</strong> · Waiting for you.<br>\nLooks done.</p>"
+        )
+        self.assertEqual(
+            self._preview(rendered), "Photo check · Waiting for you. Looks done. @Made Manager"
+        )
+
+    def test_a_plain_message_keeps_its_order(self) -> None:
+        rendered = (
+            '<p><span class="user-mention" data-user-id="7">@Made Manager</span></p>\n'
+            "<p>please look</p>"
+        )
+        self.assertEqual(self._preview(rendered), "@Made Manager please look")

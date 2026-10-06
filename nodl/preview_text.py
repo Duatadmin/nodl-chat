@@ -125,6 +125,52 @@ def split_inline_images(html: str) -> tuple[str, int]:
         return html, 0
 
 
+def _is_mention(element: lxml.html.HtmlElement) -> bool:
+    return element.tag == "span" and bool(
+        {"user-mention", "user-group-mention"} & set((element.get("class") or "").split())
+    )
+
+
+def defer_leading_mentions(html: str) -> str:
+    """Move a leading paragraph that holds only mentions to the end.
+
+    Assistant cards carry their mention line right after the card marker, so
+    nothing that cuts a message can cut the mention; the flattened preview
+    (push text) still opens with what happened and ends with the names.
+    Anything else is returned unchanged, as is the input on a parse failure.
+    """
+    if not html or "mention" not in html:
+        return html
+    try:
+        root = lxml.html.fragment_fromstring(html, create_parent="div")
+        # Skip what flattens to nothing (a paragraph the stripped marker left).
+        first = next(
+            (
+                child
+                for child in root
+                if isinstance(child.tag, str) and (len(child) or child.text_content().strip())
+            ),
+            None,
+        )
+        if first is None or first.tag != "p" or (root.text or "").strip() or first is root[-1]:
+            return html
+        if (first.text or "").strip() or not len(first):
+            return html
+        if not all(_is_mention(child) and not (child.tail or "").strip() for child in first):
+            return html
+        _remove_preserving_tail(first)
+        last = root[-1]
+        if not (last.tail or "").endswith("\n"):
+            last.tail = (last.tail or "") + "\n"  # a block break: flattening keeps a space
+        first.tail = None
+        root.append(first)
+        return (root.text or "") + "".join(
+            lxml.html.tostring(child, encoding="unicode") for child in root
+        )
+    except Exception:
+        return html
+
+
 def strip_nodl_markers(html: str) -> str:
     """Return ``html`` with nodl machine markers removed, structure intact.
 
