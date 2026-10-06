@@ -162,6 +162,9 @@ class VerificationRequestCard(BaseModel):
     # "task_deleted" or "expired" (clients word it per language). A plain
     # string, so a reason added later never fails a card update.
     closed_reason: str | None = None
+    # The backend shortened or emptied fields to fit a chat message; the full
+    # check is in its session read.
+    trimmed: bool = False
 
 
 class VerificationCheck(BaseModel):
@@ -312,6 +315,9 @@ class VerificationResultCard(BaseModel):
     # Photos the check could not read; with no `photos`, none could be read.
     skipped_photos: list[VerificationSkippedPhoto] = Field(default_factory=list)
     review: VerificationReview | None = None
+    # The backend shortened or emptied fields to fit a chat message; the full
+    # check is in its session read.
+    trimmed: bool = False
 
 
 CARD_SCHEMAS: dict[str, type[BaseModel]] = {

@@ -505,6 +505,7 @@ class TestVerificationCardSchemas(TestCase):
         self.assertEqual(envelope["payload"]["requested_shots"], [])
         self.assertFalse(envelope["payload"]["fallback_list"])
         self.assertIsNone(envelope["payload"]["note"])
+        self.assertFalse(envelope["payload"]["trimmed"])
 
     def test_request_card_keeps_nested_shots(self) -> None:
         envelope = _decode_card(
@@ -618,6 +619,7 @@ class TestVerificationCardSchemas(TestCase):
             checked_path_ids=["2/ab/wall.jpg", "2/ab/socket.jpg"],
             result_message_id=612,
             closed_reason=None,
+            trimmed=True,
         )
 
         self.assertEqual(
@@ -699,6 +701,7 @@ class TestVerificationCardSchemas(TestCase):
             skipped_photos=[
                 {"message_id": 102, "path_id": "2/ab/export.tif", "reason": "unreadable_format"}
             ],
+            trimmed=True,
             review={
                 "decision": "approve",
                 "by_user_id": "u-mgr",
