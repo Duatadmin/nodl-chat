@@ -495,7 +495,14 @@ class TestVerificationCardSchemas(TestCase):
 
         self.assertEqual(
             envelope["payload"]["shots"],
-            [{"id": "s1", "kind": "overview", "instruction": "Whole wall, from the door"}],
+            [
+                {
+                    "id": "s1",
+                    "kind": "overview",
+                    "instruction": "Whole wall, from the door",
+                    "title": None,
+                }
+            ],
         )
 
     def test_request_card_rejects_unknown_status(self) -> None:
@@ -527,7 +534,7 @@ class TestVerificationCardSchemas(TestCase):
         self.assertEqual(card["checks"][0]["photo_message_ids"], [101, 102])
         self.assertEqual(card["brief"]["prefill"]["ask_for_photo"], "Photo of the left corner")
         self.assertIsNone(card["brief"]["prefill"]["send_back_reason"])
-        self.assertEqual(card["review"], review)
+        self.assertEqual(card["review"], {**review, "by_name": None})
         self.assertEqual(card["requested_shots"], [])
         self.assertEqual(card["not_shown"], [])
         self.assertEqual(card["reviewer_user_ids"], [])
@@ -557,6 +564,125 @@ class TestVerificationCardSchemas(TestCase):
             del payload[missing]
             with self.subTest(missing=missing), self.assertRaises(ValidationError):
                 validate_card_payload("verification_result", payload)
+
+    def test_request_card_v2_fields_round_trip_with_no_key_dropped(self) -> None:
+        payload = _verification_request_payload(
+            shots=[
+                {
+                    "id": "S1",
+                    "kind": "detail",
+                    "instruction": "One socket up close",
+                    "title": "One socket",
+                },
+                {"id": "S2", "kind": "detail", "instruction": "The other socket", "title": None},
+            ],
+            requested_shots=[
+                {
+                    "text": "Close-up of socket 3",
+                    "by": "manager",
+                    "by_name": "Dana Novak",
+                    "kind": "photo",
+                },
+                {"text": "The signed test sheet", "by": "ai", "by_name": None, "kind": "document"},
+            ],
+            fallback_list=False,
+            note="Dana asked for another photo: post it here, then tap Check my photos.",
+            blocked_reason="no_new_photo",
+            photos_after_message_id=640,
+            result_message_id=612,
+        )
+
+        self.assertEqual(
+            _decode_card(encode_card("verification_request", payload))["payload"], payload
+        )
+
+    def test_request_card_v2_rejects_old_and_unknown_shapes(self) -> None:
+        for bad in (
+            {"requested_shots": ["a bare string"]},
+            {"requested_shots": [{"text": "x", "by": "foreman"}]},
+            {"requested_shots": [{"text": "x", "by": "ai", "kind": "video"}]},
+            {"blocked_reason": "no_photos"},
+        ):
+            with self.subTest(bad=bad), self.assertRaises(ValidationError):
+                validate_card_payload("verification_request", _verification_request_payload(**bad))
+
+    def test_result_card_v2_fields_round_trip_with_no_key_dropped(self) -> None:
+        payload = _verification_result_payload(
+            checks=[
+                {
+                    "id": "C1",
+                    "question": "Are all tiles grouted?",
+                    "label": "Tiles grouted",
+                    "severity": "major",
+                    "status": "partly_seen",
+                    "note": "Left corner not visible",
+                    "photo_message_ids": [101, 101],
+                    "photo_refs": [1, 2],
+                }
+            ],
+            requested_shots=[
+                {"text": "The left corner", "by": "ai", "by_name": None, "kind": "photo"}
+            ],
+            not_shown=["Are all tiles grouted?"],
+            brief={
+                "headline": "Sent by Wayan without an AI pass — Left corner not visible",
+                "override_reason": "Left corner not visible",
+                "summary": "Two of three walls are grouted.",
+                "issues": [],
+                "recommended_action": "ask_for_photo",
+                "prefill": {"ask_for_photo": "The left corner", "send_back_reason": None},
+                "in_person": [{"label": "Grout cure", "how": "Check it after 24 hours."}],
+                "plan_context": ["Submitted on the planned finish date (Tue 06 Oct)"],
+            },
+            worker_comment="Corner done after lunch",
+            submitted_by_name="Wayan Worker",
+            reviewer_user_ids=["u-mgr"],
+            reviewers=[{"id": "u-mgr", "name": "Made Manager"}],
+            photos=[
+                {"ref": 1, "message_id": 101, "path_id": "2/ab/wall.jpg"},
+                {"ref": 2, "message_id": 101, "path_id": "2/ab/corner.jpg"},
+            ],
+            photo_message_ids=[101, 101],
+            review={
+                "decision": "approve",
+                "by_user_id": "u-mgr",
+                "by_name": "Made Manager",
+                "at": "2026-10-06T12:00:00+00:00",
+                "comment": "Seal the corner on Monday.",
+            },
+        )
+
+        self.assertEqual(
+            _decode_card(encode_card("verification_result", payload))["payload"], payload
+        )
+
+    def test_result_card_v2_rejects_string_in_person_items(self) -> None:
+        payload = _verification_result_payload()
+        payload["brief"]["in_person"] = ["Grout cure — check it after 24 hours"]
+
+        with self.assertRaises(ValidationError):
+            validate_card_payload("verification_result", payload)
+
+    def test_checkin_card_keeps_extra_options(self) -> None:
+        payload = {
+            "checkin_id": str(uuid.uuid4()),
+            "task_id": str(uuid.uuid4()),
+            "workspace_id": str(uuid.uuid4()),
+            "rule": "stale_in_progress",
+            "question": "How many working days remain?",
+            "extra_options": ["done_send_photos"],
+        }
+
+        card = _decode_card(encode_card("checkin", payload))["payload"]
+
+        self.assertEqual(card["options"], ["on_track", "blocked", "needs_extension"])
+        self.assertEqual(card["extra_options"], ["done_send_photos"])
+        self.assertEqual(
+            _decode_card(encode_card("checkin", {**payload, "extra_options": []}))["payload"][
+                "extra_options"
+            ],
+            [],
+        )
 
 
 class TestTaskStreamAttachmentsValidation(TestCase):
@@ -1023,10 +1149,11 @@ class TestSendAssistantMessageMentions(TaskStreamTestCase):
         content = Message.objects.get(id=data["message_id"]).content
         self.assertTrue(content.startswith(NODL_CARD_PREFIX))
         self.assertEqual(_decode_card(content)["card_type"], "verification_request")
+        # The mention line goes last: the push opens with what happened.
         self.assertTrue(
             content.endswith(
-                f"\n\n@**Made Manager|{self.manager.id}** @**Wayan Worker|{self.worker.id}**"
                 "\n\nPhotos received: checking now."
+                f"\n\n@**Made Manager|{self.manager.id}** @**Wayan Worker|{self.worker.id}**"
             )
         )
         self.assertTrue(self._mentioned(self.manager, data["message_id"]))
@@ -1039,8 +1166,9 @@ class TestSendAssistantMessageMentions(TaskStreamTestCase):
         self.assertEqual(data["skipped_mentions"], [])
         self.assertEqual(
             Message.objects.get(id=data["message_id"]).content,
-            f"@**Made Manager|{self.manager.id}**\n\nPlease check.",
+            f"Please check.\n\n@**Made Manager|{self.manager.id}**",
         )
+        self.assertTrue(self._mentioned(self.manager, data["message_id"]))
 
     def test_name_with_asterisk_uses_id_only_syntax(self) -> None:
         starred, starred_supabase_id = self._make_user(self.realm, "Putu *Site* Lead")
@@ -1051,7 +1179,7 @@ class TestSendAssistantMessageMentions(TaskStreamTestCase):
         data = self._send(content="Please check.", mention_user_ids=[str(starred_supabase_id)])
 
         content = Message.objects.get(id=data["message_id"]).content
-        self.assertEqual(content, f"@**|{starred.id}**\n\nPlease check.")
+        self.assertEqual(content, f"Please check.\n\n@**|{starred.id}**")
         self.assertTrue(self._mentioned(starred, data["message_id"]))
 
     def test_nothing_resolves_sends_content_unchanged(self) -> None:
@@ -1061,3 +1189,57 @@ class TestSendAssistantMessageMentions(TaskStreamTestCase):
 
         self.assertEqual(data["skipped_mentions"], [unknown])
         self.assertEqual(Message.objects.get(id=data["message_id"]).content, "Please check.")
+
+    def test_push_text_opens_with_the_status_and_ends_with_the_mention(self) -> None:
+        """GB-49 flattening of a work-verification ping: the card marker is
+        stripped, markdown and line breaks flatten to one line, the status
+        leads and the mention comes last — and the mention still pings."""
+        from nodl.message_preview import message_preview_text
+        from zerver.lib.push_notifications import truncate_content
+
+        card_payload = _verification_result_payload(
+            task_id=str(self.task_id), workspace_id=str(self.workspace_id)
+        )
+        data = self._send(
+            content=(
+                "**Photo check** · Waiting for you.\n"
+                "Looks done — recommend approving. Six sockets on the east wall."
+            ),
+            card_type="verification_result",
+            card_payload=card_payload,
+            mention_user_ids=[str(self.manager_supabase_id)],
+        )
+
+        message = Message.objects.get(id=data["message_id"])
+        push = message_preview_text(message.rendered_content, message.content, message.id)
+        self.assertEqual(
+            push,
+            "Photo check · Waiting for you. Looks done — recommend approving. "
+            "Six sockets on the east wall. @Made Manager",
+        )
+        self.assertEqual(truncate_content(push), (push, False))
+        self.assertTrue(self._mentioned(self.manager, data["message_id"]))
+        self.assertFalse(self._mentioned(self.worker, data["message_id"]))
+
+    def test_a_long_push_is_cut_before_the_mention_never_after_the_status(self) -> None:
+        from nodl.message_preview import message_preview_text
+        from zerver.lib.push_notifications import truncate_content
+
+        long_line = "Mostly done — sent to Made; Wayan can fix 1 thing: " + "plate tilted, " * 20
+        data = self._send(
+            content=f"**Photo check** · With Made.\n{long_line}",
+            card_type="verification_result",
+            card_payload=_verification_result_payload(
+                task_id=str(self.task_id), workspace_id=str(self.workspace_id)
+            ),
+            mention_user_ids=[str(self.manager_supabase_id), str(self.worker_supabase_id)],
+        )
+
+        message = Message.objects.get(id=data["message_id"])
+        push, truncated = truncate_content(
+            message_preview_text(message.rendered_content, message.content, message.id)
+        )
+        self.assertTrue(truncated)
+        self.assertTrue(push.startswith("Photo check · With Made. Mostly done — sent to Made;"))
+        self.assertTrue(self._mentioned(self.manager, data["message_id"]))
+        self.assertTrue(self._mentioned(self.worker, data["message_id"]))

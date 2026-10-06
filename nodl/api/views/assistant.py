@@ -76,8 +76,9 @@ class AssistantSendPayload(BaseModel):
     content: str
     card_type: str | None = None
     card_payload: dict[str, Any] | None = None
-    # Supabase user ids to @-mention (work verification pings the reviewer
-    # or the worker). Absent or empty leaves the message exactly as before.
+    # Supabase user ids to @-mention on a line after the text (work
+    # verification pings the reviewer or the worker). Absent or empty leaves
+    # the message exactly as before.
     mention_user_ids: list[str] | None = None
 
 
@@ -434,9 +435,11 @@ def send_assistant_message(request: HttpRequest) -> HttpResponse:
     Sends via check_send_message so the normal event queue delivers it to
     connected clients in real time.
 
-    `mention_user_ids` (Supabase ids) prepends one `@**Full Name|id**` line to
-    the markdown fallback — after the card marker, which stays first — so the
-    people named get Zulip's normal mention push. Ids that don't resolve to an
+    `mention_user_ids` (Supabase ids) appends one `@**Full Name|id**` line to
+    the markdown fallback, so the people named get Zulip's normal mention
+    push (the mention flag comes from the rendered content, wherever the
+    mention sits). It goes last so the push text — the flattened fallback —
+    opens with what happened, not with names. Ids that don't resolve to an
     active subscriber of the stream are skipped and echoed back as
     `skipped_mentions`. Without it, content and response are unchanged.
     """
@@ -486,7 +489,7 @@ def send_assistant_message(request: HttpRequest) -> HttpResponse:
     if payload.mention_user_ids:
         mention_line, skipped_mentions = _resolve_mentions(extension, payload.mention_user_ids)
         if mention_line:
-            fallback_markdown = f"{mention_line}\n\n{fallback_markdown}"
+            fallback_markdown = f"{fallback_markdown}\n\n{mention_line}"
 
     if payload.card_type is not None:
         try:

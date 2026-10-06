@@ -13,12 +13,18 @@ consumer — never hard-fail rendering.
 Registered card types (``CARD_SCHEMAS``):
 
 - ``ask_ai_answer`` — Ask AI result in a task stream.
-- ``checkin`` — supervisor check-in with status buttons.
+- ``checkin`` — supervisor check-in with status buttons (``extra_options``:
+  buttons only newer clients render, e.g. work verification's
+  ``done_send_photos``).
 - ``call_event`` — voice-call lifecycle event in a DM.
 - ``verification_request`` — work verification: the photo list a worker is
   asked to post in the task chat, updated in place as the check progresses.
 - ``verification_result`` — work verification: one AI check run and the
   manager's review of it.
+
+The verification cards follow contract v2 (nodl-backend
+``docs/work-verification/M-PHASE-PLAN.md`` §3). Pydantic drops keys a schema
+doesn't declare, so every field the backend sends is declared here.
 """
 
 import base64
@@ -60,6 +66,10 @@ class CheckinCard(BaseModel):
     # statusing cards, and the recorded answer on the responded re-encode.
     remaining_options: list[int] = Field(default_factory=list)
     remaining_days: int | None = None
+    # Option keys only newer clients render (work verification:
+    # "done_send_photos"). Kept apart from `options` because the clients
+    # already shipped render every `options` key as a button.
+    extra_options: list[str] = Field(default_factory=list)
     status: Literal["pending", "responded"] = "pending"
     response: str | None = None
 
@@ -87,6 +97,19 @@ class VerificationShot(BaseModel):
     id: str
     kind: str
     instruction: str
+    # A short name for the shot (newer scenario specs); clients fall back to
+    # the instruction.
+    title: str | None = None
+
+
+class VerificationRequestedShot(BaseModel):
+    """An extra photo someone asked for: the AI, or the manager (named)."""
+
+    text: str
+    by: Literal["ai", "manager"]
+    by_name: str | None = None
+    # "document" when the task can't be shown in photos (proof is asked for).
+    kind: Literal["photo", "document"] = "photo"
 
 
 class VerificationRequestCard(BaseModel):
@@ -111,10 +134,18 @@ class VerificationRequestCard(BaseModel):
     ]
     shots: list[VerificationShot]
     # Extra photos the AI or the manager asked for.
-    requested_shots: list[str] = Field(default_factory=list)
+    requested_shots: list[VerificationRequestedShot] = Field(default_factory=list)
     # True when `shots` is the generic per-archetype list (scenario failed).
     fallback_list: bool = False
     note: str | None = None
+    # "Check my photos" was tapped after the manager's request with no new
+    # photo posted; cleared once a check finds one.
+    blocked_reason: Literal["no_new_photo"] | None = None
+    # Clients count new human photos posted after this message (None: after
+    # this card). After a photo request: the message that asked for it.
+    photos_after_message_id: int | None = None
+    # The result card that shows where the check stands.
+    result_message_id: int | None = None
 
 
 class VerificationCheck(BaseModel):
@@ -122,10 +153,40 @@ class VerificationCheck(BaseModel):
 
     id: str
     question: str
+    # A short statement of the check (newer scenario specs); clients fall
+    # back to the question.
+    label: str | None = None
     severity: str
     status: Literal["pass", "partly_seen", "fail", "cannot_see"]
     note: str
     photo_message_ids: list[int]
+    # The photos that show it, by `VerificationPhoto.ref`.
+    photo_refs: list[int] = Field(default_factory=list)
+
+
+class VerificationPhoto(BaseModel):
+    """One photo the AI saw, numbered from 1 in the order it saw them.
+
+    Several photos of one composer send share a message id.
+    """
+
+    ref: int
+    message_id: int
+    path_id: str
+
+
+class VerificationPerson(BaseModel):
+    """Someone a card names."""
+
+    id: str
+    name: str
+
+
+class VerificationInPerson(BaseModel):
+    """Something photos can't confirm, and how to check it instead."""
+
+    label: str
+    how: str
 
 
 class VerificationBriefPrefill(BaseModel):
@@ -139,6 +200,8 @@ class VerificationBrief(BaseModel):
     """The manager's brief for one run."""
 
     headline: str
+    # On a worker override ("send to manager anyway"): the first finding.
+    override_reason: str | None = None
     summary: str
     issues: list[str]
     recommended_action: Literal[
@@ -150,7 +213,7 @@ class VerificationBrief(BaseModel):
         "review_photos",
     ]
     prefill: VerificationBriefPrefill
-    in_person: list[str]
+    in_person: list[VerificationInPerson]
     plan_context: list[str]
 
 
@@ -159,7 +222,9 @@ class VerificationReview(BaseModel):
 
     decision: Literal["approve", "reject", "request_more"]
     by_user_id: str
+    by_name: str | None = None
     at: str
+    # The reason, the photo asked for, or an approval's note.
     comment: str | None
 
 
@@ -200,13 +265,17 @@ class VerificationResultCard(BaseModel):
         | None
     )
     checks: list[VerificationCheck]
-    requested_shots: list[str] = Field(default_factory=list)
+    requested_shots: list[VerificationRequestedShot] = Field(default_factory=list)
     # Check questions no photo showed.
     not_shown: list[str] = Field(default_factory=list)
     brief: VerificationBrief
     worker_comment: str | None = None
     submitted_by: str
+    submitted_by_name: str | None = None
     reviewer_user_ids: list[str] = Field(default_factory=list)
+    # The reviewers named, lead first (those whose account resolves).
+    reviewers: list[VerificationPerson] = Field(default_factory=list)
+    photos: list[VerificationPhoto] = Field(default_factory=list)
     photo_message_ids: list[int] = Field(default_factory=list)
     review: VerificationReview | None = None
 
