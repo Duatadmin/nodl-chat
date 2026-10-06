@@ -595,7 +595,9 @@ class TestVerificationCardSchemas(TestCase):
             fallback_list=False,
             note="Dana asked for another photo: post it here, then tap Check my photos.",
             blocked_reason="no_new_photo",
-            photos_after_message_id=640,
+            photos_after_message_id=None,
+            photos_after_at=1791288000,
+            checked_path_ids=["2/ab/wall.jpg", "2/ab/socket.jpg"],
             result_message_id=612,
             closed_reason=None,
         )
@@ -618,10 +620,17 @@ class TestVerificationCardSchemas(TestCase):
             {"requested_shots": ["a bare string"]},
             {"requested_shots": [{"text": "x", "by": "foreman"}]},
             {"requested_shots": [{"text": "x", "by": "ai", "kind": "video"}]},
-            {"blocked_reason": "no_photos"},
         ):
             with self.subTest(bad=bad), self.assertRaises(ValidationError):
                 validate_card_payload("verification_request", _verification_request_payload(**bad))
+
+    def test_request_card_keeps_a_blocked_reason_added_later(self) -> None:
+        payload = _verification_request_payload(blocked_reason="a_reason_added_later")
+
+        card = _decode_card(encode_card("verification_request", payload))["payload"]
+
+        self.assertEqual(card["blocked_reason"], "a_reason_added_later")
+        self.assertEqual((card["photos_after_at"], card["checked_path_ids"]), (None, []))
 
     def test_result_card_v2_fields_round_trip_with_no_key_dropped(self) -> None:
         payload = _verification_result_payload(
@@ -659,13 +668,19 @@ class TestVerificationCardSchemas(TestCase):
             },
             worker_comment="Corner done after lunch",
             submitted_by_name="Wayan Worker",
-            reviewer_user_ids=["u-mgr"],
+            escalated_by="u-foreman",
+            escalated_by_name="I Ketut Foreman",
+            reviewer_user_ids=["u-mgr", "u-mgr-2"],
             reviewers=[{"id": "u-mgr", "name": "Made Manager"}],
+            ask_kind="document",
             photos=[
                 {"ref": 1, "message_id": 101, "path_id": "2/ab/wall.jpg"},
                 {"ref": 2, "message_id": 101, "path_id": "2/ab/corner.jpg"},
             ],
             photo_message_ids=[101, 101],
+            skipped_photos=[
+                {"message_id": 102, "path_id": "2/ab/export.tif", "reason": "unreadable_format"}
+            ],
             review={
                 "decision": "approve",
                 "by_user_id": "u-mgr",
@@ -685,6 +700,30 @@ class TestVerificationCardSchemas(TestCase):
 
         with self.assertRaises(ValidationError):
             validate_card_payload("verification_result", payload)
+
+    def test_checkin_card_keeps_the_extra_response(self) -> None:
+        payload = {
+            "checkin_id": str(uuid.uuid4()),
+            "task_id": str(uuid.uuid4()),
+            "workspace_id": str(uuid.uuid4()),
+            "rule": "stale_in_progress",
+            "question": "How many working days remain?",
+            "extra_options": ["done_send_photos"],
+            "status": "responded",
+            "response": "on_track",
+            "extra_response": "done_send_photos",
+        }
+
+        card = _decode_card(encode_card("checkin", payload))["payload"]
+
+        self.assertEqual(
+            (card["response"], card["extra_response"]), ("on_track", "done_send_photos")
+        )
+        self.assertIsNone(
+            _decode_card(encode_card("checkin", {**payload, "extra_response": None}))["payload"][
+                "extra_response"
+            ]
+        )
 
     def test_checkin_card_keeps_extra_options(self) -> None:
         payload = {

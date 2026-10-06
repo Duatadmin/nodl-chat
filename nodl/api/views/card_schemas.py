@@ -15,7 +15,8 @@ Registered card types (``CARD_SCHEMAS``):
 - ``ask_ai_answer`` — Ask AI result in a task stream.
 - ``checkin`` — supervisor check-in with status buttons (``extra_options``:
   buttons only newer clients render, e.g. work verification's
-  ``done_send_photos``).
+  ``done_send_photos``; ``extra_response``: that answer on the answered
+  card, whose ``response`` stays a key every client knows).
 - ``call_event`` — voice-call lifecycle event in a DM.
 - ``verification_request`` — work verification: the photo list a worker is
   asked to post in the task chat, updated in place as the check progresses.
@@ -72,6 +73,9 @@ class CheckinCard(BaseModel):
     extra_options: list[str] = Field(default_factory=list)
     status: Literal["pending", "responded"] = "pending"
     response: str | None = None
+    # The answer given with an `extra_options` key (e.g. "done_send_photos",
+    # recorded as `response` "on_track"): newer clients show it instead.
+    extra_response: str | None = None
 
 
 class CallEventCard(BaseModel):
@@ -140,12 +144,18 @@ class VerificationRequestCard(BaseModel):
     # True when `shots` is the generic per-archetype list (scenario failed).
     fallback_list: bool = False
     note: str | None = None
-    # "Check my photos" was tapped after the manager's request with no new
-    # photo posted; cleared once a check finds one.
-    blocked_reason: Literal["no_new_photo"] | None = None
-    # Clients count new human photos posted after this message (None: after
-    # this card). After a photo request: the message that asked for it.
+    # Why "Check my photos" is waiting: "no_new_photo" (tapped after the
+    # manager's request with no new photo posted; cleared once a check finds
+    # one). A plain string, so a reason added later never fails a card update.
+    blocked_reason: str | None = None
+    # Which photos the live-edge bar may count as new — exactly those a check
+    # would take: human image attachments after this card, each photo (path
+    # id) at the first message carrying it, new when that message is after
+    # `photos_after_message_id`, sent at or after `photos_after_at` (epoch
+    # seconds) and its path id is not in `checked_path_ids` (unset = no limit).
     photos_after_message_id: int | None = None
+    photos_after_at: int | None = None
+    checked_path_ids: list[str] = Field(default_factory=list)
     # The result card that shows where the check stands.
     result_message_id: int | None = None
     # Why a closed check closed: "closed_without_review", "task_archived",
@@ -179,6 +189,16 @@ class VerificationPhoto(BaseModel):
     ref: int
     message_id: int
     path_id: str
+
+
+class VerificationSkippedPhoto(BaseModel):
+    """A photo the check could not read (too large, a format it can't read,
+    a download that failed)."""
+
+    message_id: int
+    path_id: str
+    # A plain string, so a reason added later never fails a card update.
+    reason: str
 
 
 class VerificationPerson(BaseModel):
@@ -275,14 +295,22 @@ class VerificationResultCard(BaseModel):
     # Check questions no photo showed.
     not_shown: list[str] = Field(default_factory=list)
     brief: VerificationBrief
+    # On a worker override: the note of whoever sent it on (`escalated_by`).
     worker_comment: str | None = None
     submitted_by: str
     submitted_by_name: str | None = None
+    # On a worker override: who sent it on anyway — the worker or a crew-mate.
+    escalated_by: str | None = None
+    escalated_by_name: str | None = None
     reviewer_user_ids: list[str] = Field(default_factory=list)
-    # The reviewers named, lead first (those whose account resolves).
+    # The lead reviewer, when they have a name (`reviewer_user_ids` has all).
     reviewers: list[VerificationPerson] = Field(default_factory=list)
+    # What "ask for more" asks for: proof on a task photos can't show.
+    ask_kind: Literal["photo", "document"] = "photo"
     photos: list[VerificationPhoto] = Field(default_factory=list)
     photo_message_ids: list[int] = Field(default_factory=list)
+    # Photos the check could not read; with no `photos`, none could be read.
+    skipped_photos: list[VerificationSkippedPhoto] = Field(default_factory=list)
     review: VerificationReview | None = None
 
 
