@@ -175,9 +175,12 @@ def _get_subscribed_task_stream_extension(
     )
     if not task_extension:
         return None
+    # active=True: removing a member only deactivates their Subscription row;
+    # archiving keeps subscriptions active, so subscribers keep access.
     is_subscribed = Subscription.objects.filter(
         user_profile=user,
         recipient=task_extension.zulip_stream.recipient,
+        active=True,
     ).exists()
     return task_extension if is_subscribed else None
 

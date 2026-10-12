@@ -13,6 +13,7 @@ from contextlib import suppress
 from functools import wraps
 from typing import Any
 
+from django.db.models import Exists, OuterRef, Q, QuerySet
 from django.http import HttpRequest, HttpResponse, JsonResponse
 from django.views.decorators.csrf import csrf_exempt
 from pydantic import ValidationError
@@ -32,8 +33,18 @@ from zerver.lib.muted_users import get_mute_object
 from zerver.lib.rate_limiter import RateLimitedObject, RedisRateLimiterBackend
 from zerver.lib.response import json_response_from_error
 from zerver.lib.streams import access_stream_by_id
+from zerver.lib.user_groups import get_recursive_membership_groups
 from zerver.lib.users import access_user_by_id_including_cross_realm
-from zerver.models import Message, MutedUser, Reaction, Subscription, UserMessage, UserProfile
+from zerver.models import (
+    Message,
+    MutedUser,
+    Reaction,
+    Recipient,
+    Stream,
+    Subscription,
+    UserMessage,
+    UserProfile,
+)
 from zerver.models.clients import get_client
 
 logger = logging.getLogger(__name__)
@@ -58,15 +69,60 @@ def _access_stream_or_archived_task_stream(user: UserProfile, stream_id: int):
             )
             .first()
         )
+        # active=True: removing a member only deactivates their Subscription
+        # row; archiving keeps subscriptions active, so subscribers keep access.
         if (
             not task_extension
             or not Subscription.objects.filter(
                 user_profile=user,
                 recipient=task_extension.zulip_stream.recipient,
+                active=True,
             ).exists()
         ):
             raise
         return task_extension.zulip_stream
+
+
+def _accessible_messages_query(user: UserProfile) -> QuerySet[Message]:
+    """Messages the user may read across all conversations (the combined feed).
+
+    Upstream's combined-feed semantics, in ORM form (mirrors
+    zerver.lib.narrow.get_base_query_for_search with need_user_message=True):
+    only messages the user has a UserMessage row for, and stream messages only
+    while the user still has content access to the stream — so leftover rows
+    from a stream the user was removed from grant nothing. Public-stream
+    history the user never received is not included, as upstream; an explicit
+    stream narrow serves it. Archived streams keep their subscriptions, so
+    their subscribers still see them here.
+    """
+    # Group-based content access never applies to guests (see
+    # has_channel_content_access_helper).
+    user_group_ids: list[int] = []
+    if not user.is_guest:
+        user_group_ids = list(get_recursive_membership_groups(user).values_list("id", flat=True))
+
+    access = ~Q(recipient__type=Recipient.STREAM) | Q(
+        Exists(
+            Subscription.objects.filter(
+                user_profile=user, recipient_id=OuterRef("recipient_id"), active=True
+            )
+        )
+    )
+    stream_grants = Q()
+    if user.can_access_public_streams():
+        stream_grants |= Q(invite_only=False)
+    if user_group_ids:
+        stream_grants |= Q(can_subscribe_group_id__in=user_group_ids) | Q(
+            can_add_subscribers_group_id__in=user_group_ids
+        )
+    if stream_grants:
+        access |= Q(
+            Exists(Stream.objects.filter(stream_grants, recipient_id=OuterRef("recipient_id")))
+        )
+
+    # No realm_id filter, as upstream: user_profile_id is the selective
+    # predicate, and a user only has UserMessage rows in their own realm.
+    return Message.objects.filter(usermessage__user_profile=user).filter(access)
 
 
 class MessagesRateLimitedObject(RateLimitedObject):
@@ -314,6 +370,9 @@ def list_messages(request: HttpRequest) -> HttpResponse:
       - [{"operator":"dm","operand":[9]}] - DMs with user 9
       - [{"operator":"dm","operand":[9,12]}] - Group DM with users 9 and 12
 
+    No narrow (or narrow=[]) and no stream_id: the combined feed — only
+    messages the user can read (see _accessible_messages_query).
+
     Common parameters:
     - anchor: 'newest', 'oldest', or message_id (default: 'newest')
     - num_before: Messages before anchor (default: 50)
@@ -384,9 +443,10 @@ def list_messages(request: HttpRequest) -> HttpResponse:
                 status=400,
             )
 
-        # Empty narrow = all messages in user's realm
+        # Empty narrow = the combined feed (mobile CombinedFeedNarrow): every
+        # message the user can read, never the whole realm.
         if len(narrow_terms) == 0:
-            base_query = Message.objects.filter(realm_id=user.realm_id)
+            base_query = _accessible_messages_query(user)
         else:
             # Parse the narrow operator
             term = narrow_terms[0]
@@ -513,8 +573,8 @@ def list_messages(request: HttpRequest) -> HttpResponse:
         if topic:
             base_query = base_query.filter(subject__iexact=topic)
     else:
-        # No narrow and no stream_id — return all messages in user's realm
-        base_query = Message.objects.filter(realm_id=user.realm_id)
+        # No narrow and no stream_id — same combined feed as an empty narrow
+        base_query = _accessible_messages_query(user)
 
     # Apply anchor-based pagination to get message IDs
     anchor_message_id = None

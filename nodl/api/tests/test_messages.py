@@ -154,17 +154,27 @@ class TestListMessages(TestCase):
         self.factory = RequestFactory()
         self.user = MockUserProfile()
 
-    def test_stream_id_required(self) -> None:
-        """Test stream_id is required."""
-        request = self.factory.get("/api/v1/messages")
-        request.user_profile = self.user
+    @patch("nodl.api.views.messages._accessible_messages_query")
+    def test_no_stream_id_lists_the_access_filtered_feed(self, mock_feed: MagicMock) -> None:
+        """No narrow and no stream_id: the combined feed, never the whole realm.
 
-        response = list_messages(request)
+        Access semantics are covered against a real DB in
+        test_read_access.
+        """
+        mock_qs = MagicMock()
+        mock_qs.order_by.return_value = mock_qs
+        mock_qs.values_list.return_value = mock_qs
+        mock_qs.__getitem__ = MagicMock(return_value=[])
+        mock_feed.return_value = mock_qs
 
-        self.assertEqual(response.status_code, 400)
-        data = json.loads(response.content)
-        self.assertEqual(data["code"], "INVALID_PARAMS")
-        self.assertIn("stream_id", data["msg"])
+        for query in ("", "?narrow=[]"):
+            request = self.factory.get(f"/api/v1/messages{query}")
+            request.user_profile = self.user
+
+            response = list_messages(request)
+
+            self.assertEqual(response.status_code, 200)
+            mock_feed.assert_called_with(self.user)
 
     @patch("nodl.api.views.messages.access_stream_by_id")
     def test_stream_not_found_returns_404(
