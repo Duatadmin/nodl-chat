@@ -68,9 +68,10 @@ class CheckinCard(BaseModel):
     # The question variant the backend picked (`<rule>.<n>`) and its
     # placeholders (`{"due": iso-date-or-null}`), so clients word the
     # question in the reader's language; `question` stays the English text
-    # for web, push and clients that predate the key.
+    # for web, push and clients that predate the key. Values are any JSON, so
+    # a param added later (a number, say) never fails a card.
     question_key: str | None = None
-    params: dict[str, str | None] = Field(default_factory=dict)
+    params: dict[str, Any] = Field(default_factory=dict)
     due_date: str | None = None
     options: list[str] = Field(default_factory=lambda: ["on_track", "blocked", "needs_extension"])
     # Story 7.33: numeric one-tap remaining-duration chips (working days) on

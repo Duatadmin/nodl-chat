@@ -808,6 +808,11 @@ class TestVerificationCardSchemas(TestCase):
         # No due date: the placeholder is kept as an explicit null.
         no_due = _decode_card(encode_card("checkin", {**payload, "params": {"due": None}}))
         self.assertEqual(no_due["payload"]["params"], {"due": None})
+        # A param added later with a non-string value never fails the card.
+        later = _decode_card(
+            encode_card("checkin", {**payload, "params": {"due": "2026-10-20", "days": 3}})
+        )
+        self.assertEqual(later["payload"]["params"], {"due": "2026-10-20", "days": 3})
         # The update-card path re-encodes through the same schema.
         content = build_card_message_content("checkin", payload, "**Check-in**")
         self.assertEqual(_decode_card(content)["payload"]["question_key"], "deadline_approaching.0")
