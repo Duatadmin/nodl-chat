@@ -788,6 +788,44 @@ class TestVerificationCardSchemas(TestCase):
             [],
         )
 
+    def test_checkin_card_keeps_the_question_key_and_params(self) -> None:
+        payload = {
+            "checkin_id": str(uuid.uuid4()),
+            "task_id": str(uuid.uuid4()),
+            "workspace_id": str(uuid.uuid4()),
+            "rule": "deadline_approaching",
+            "question": "This task is due 2026-10-20. Is it on track?",
+            "question_key": "deadline_approaching.0",
+            "params": {"due": "2026-10-20"},
+            "due_date": "2026-10-20T00:00:00+00:00",
+        }
+
+        card = _decode_card(encode_card("checkin", payload))["payload"]
+
+        self.assertEqual(card["question_key"], "deadline_approaching.0")
+        self.assertEqual(card["params"], {"due": "2026-10-20"})
+        self.assertEqual(card["question"], payload["question"])
+        # No due date: the placeholder is kept as an explicit null.
+        no_due = _decode_card(encode_card("checkin", {**payload, "params": {"due": None}}))
+        self.assertEqual(no_due["payload"]["params"], {"due": None})
+        # The update-card path re-encodes through the same schema.
+        content = build_card_message_content("checkin", payload, "**Check-in**")
+        self.assertEqual(_decode_card(content)["payload"]["question_key"], "deadline_approaching.0")
+
+    def test_checkin_card_from_an_older_backend_still_validates(self) -> None:
+        payload = {
+            "checkin_id": str(uuid.uuid4()),
+            "task_id": str(uuid.uuid4()),
+            "workspace_id": str(uuid.uuid4()),
+            "rule": "stale_in_progress",
+            "question": "How many working days remain?",
+        }
+
+        card = _decode_card(encode_card("checkin", payload))["payload"]
+
+        self.assertIsNone(card["question_key"])
+        self.assertEqual(card["params"], {})
+
 
 class TestTaskStreamAttachmentsValidation(TestCase):
     def setUp(self) -> None:

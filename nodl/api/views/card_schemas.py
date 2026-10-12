@@ -65,6 +65,12 @@ class CheckinCard(BaseModel):
     workspace_id: str
     rule: str
     question: str
+    # The question variant the backend picked (`<rule>.<n>`) and its
+    # placeholders (`{"due": iso-date-or-null}`), so clients word the
+    # question in the reader's language; `question` stays the English text
+    # for web, push and clients that predate the key.
+    question_key: str | None = None
+    params: dict[str, str | None] = Field(default_factory=dict)
     due_date: str | None = None
     options: list[str] = Field(default_factory=lambda: ["on_track", "blocked", "needs_extension"])
     # Story 7.33: numeric one-tap remaining-duration chips (working days) on
