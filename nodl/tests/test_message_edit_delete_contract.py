@@ -32,6 +32,7 @@ MESSAGES_VIEWS_PY = REPO_ROOT / "nodl/api/views/messages.py"
 NODL_URLS_PY = REPO_ROOT / "nodl/api/urls.py"
 RETENTION_PY = REPO_ROOT / "zerver/lib/retention.py"
 MESSAGE_EDIT_ACTIONS_PY = REPO_ROOT / "zerver/actions/message_edit.py"
+NODL_DERIVED_WORKER_PY = REPO_ROOT / "zerver/worker/nodl_derived_content.py"
 WORKSPACE_SYNC_PY = REPO_ROOT / "nodl/sync/workspace_sync.py"
 
 
@@ -114,6 +115,21 @@ class TranslationRequeueTest(unittest.TestCase):
         # Scope parity with the send-time block: humans + no attachments only.
         self.assertIn("is_bot", src)
         self.assertIn("potential_attachment_path_ids", src)
+
+    def test_requeued_edit_is_tagged_and_forwarded_as_an_edit(self) -> None:
+        # Untagged, the backend takes the edit for a duplicate send and the
+        # edited message is never translated again.
+        src = _function_source(MESSAGE_EDIT_ACTIONS_PY, "check_update_message")
+        self.assertIn('"edited": True', src)
+        worker = NODL_DERIVED_WORKER_PY.read_text()
+        self.assertIn('"reason": "edit" if event.get("edited") else "send"', worker)
+
+    def test_voice_block_is_carried_into_the_new_render(self) -> None:
+        # Before do_update_message, so the row and the edit event both keep
+        # the voice transcript and translations.
+        src = _function_source(MESSAGE_EDIT_ACTIONS_PY, "check_update_message")
+        self.assertIn("carry_voice_derived_block(", src)
+        self.assertLess(src.index("carry_voice_derived_block("), src.index("do_update_message("))
 
 
 class RealmWindowDefaultsTest(unittest.TestCase):

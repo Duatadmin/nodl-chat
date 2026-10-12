@@ -1685,6 +1685,21 @@ def check_update_message(
                 message, user_profile, topic_name, stream_id
             )
 
+    # NODL MODIFICATION START — the re-render above drops the derived block
+    # nodl appended to a voice note (transcript + translations). An edit that
+    # keeps the voice note keeps its audio, so carry the old block into the
+    # new render; it then reaches the row and the edit event together.
+    if rendering_result is not None:
+        from nodl.derived_content import carry_voice_derived_block, content_voice_note_path_ids
+
+        rendering_result.rendered_content = carry_voice_derived_block(
+            message.rendered_content or "",
+            rendering_result.rendered_content,
+            content_voice_note_path_ids(message.content),
+            rendering_result.potential_attachment_path_ids,
+        )
+    # NODL MODIFICATION END
+
     updated_message_result = do_update_message(
         user_profile,
         message,
@@ -1712,9 +1727,11 @@ def check_update_message(
     # in message_send.py: a content edit re-renders rendered_content, which
     # wipes any appended nodl translation block, so re-queue the message as a
     # translation candidate under the same scope rules (human sender, plain
-    # text, no attachment references). Voice notes are deliberately excluded:
-    # they carry /user_uploads references, and re-transcription on edit would
-    # re-bill AssemblyAI for content that didn't change.
+    # text, no attachment references). `edited` tells the backend this is an
+    # edit, so it re-translates new text instead of ignoring a duplicate.
+    # Voice notes are deliberately excluded: they carry /user_uploads
+    # references, re-transcription on edit would re-bill AssemblyAI for
+    # content that didn't change, and their block is carried over above.
     if message_edit_request.is_content_edited and rendering_result is not None:
         from nodl.derived_content import translation_text
 
@@ -1729,6 +1746,7 @@ def check_update_message(
                     "message_id": message.id,
                     "message_realm_id": user_profile.realm_id,
                     "path_ids": [],
+                    "edited": True,
                 },
             )
     # NODL MODIFICATION END

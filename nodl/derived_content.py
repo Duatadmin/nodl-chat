@@ -20,6 +20,7 @@ Design constraints the shape encodes:
 """
 
 import base64
+import hashlib
 import json
 import re
 from collections.abc import Iterable
@@ -31,9 +32,20 @@ from nodl.preview_text import contains_nodl_marker
 
 DERIVED_PAYLOAD_VERSION = 1
 
+# Derived-content kinds, as nodl-backend's ChatDerivedKind names them.
+VOICE_TRANSCRIPT_KIND = "voice_transcript"
+TEXT_TRANSLATION_KIND = "text_translation"
+
 # The voice-note discriminator: filenames minted by the mobile composer
 # (`voice-<epoch-ms>.m4a`). path_ids look like "2/ab/xyz/voice-1723500000.m4a".
 VOICE_NOTE_PATH_ID_RE = re.compile(r"(?:^|/)voice-\d+\.m4a$")
+
+# An upload path_id referenced from raw message content: a relative
+# `/user_uploads/<path_id>` link target or the same path on an absolute URL.
+_CONTENT_UPLOAD_PATH_RE = re.compile(r"/user_uploads/([^\s()\[\]<>\"'?#]+)")
+
+# The payload comment of a derived block (the block regex below includes it).
+_DERIVED_PAYLOAD_RE = re.compile(r"<!--\s*nodl-derived:v1:([A-Za-z0-9_=-]+)\s*-->")
 
 # One appended block, for idempotent replace on re-attach. Matches the comment
 # plus its companion transcript paragraph (either may be re-generated).
@@ -54,6 +66,11 @@ def voice_note_path_ids(path_ids: Iterable[str]) -> list[str]:
     return [p for p in path_ids if VOICE_NOTE_PATH_ID_RE.search(p)]
 
 
+def content_voice_note_path_ids(content: str) -> list[str]:
+    """The voice-note uploads a message's raw content links to."""
+    return voice_note_path_ids(_CONTENT_UPLOAD_PATH_RE.findall(content))
+
+
 def translation_text(content: str) -> str | None:
     """The translatable text of a message, or None when it shouldn't translate.
 
@@ -69,6 +86,44 @@ def translation_text(content: str) -> str | None:
     if not text or "/user_uploads/" in text or contains_nodl_marker(text):
         return None
     return text
+
+
+def translation_source_hash(text: str) -> str:
+    """Hash of a translation source, as nodl-backend stores it in
+    chat_message_derived.source_hash: hex SHA-256 of the stripped UTF-8 text.
+
+    The text is what translation_text() returned when the message was sent
+    to the backend, so both sides hash the same string.
+    """
+    return hashlib.sha256(text.strip().encode("utf-8")).hexdigest()
+
+
+def carry_voice_derived_block(
+    old_rendered: str,
+    new_rendered: str,
+    old_paths: Iterable[str],
+    new_paths: Iterable[str],
+) -> str:
+    """Keep a voice note's derived block across an edit of its message.
+
+    An edit re-renders rendered_content from markdown, which drops the
+    appended block. When the edited message still links a voice note the
+    old one linked, the audio is unchanged, so its transcript and
+    translations stay valid: the old block is appended to the new render
+    (no re-transcription, no re-bill, and the edit event already carries
+    it). A text-translation block is never carried: the edit changed the
+    text it translated.
+    """
+    if not set(voice_note_path_ids(old_paths)) & set(voice_note_path_ids(new_paths)):
+        return new_rendered
+    block = DERIVED_BLOCK_RE.search(old_rendered)
+    if block is None:
+        return new_rendered
+    payload_comment = _DERIVED_PAYLOAD_RE.search(block.group(0))
+    payload = decode_derived_payload(payload_comment.group(1)) if payload_comment else None
+    if payload is None or payload.get("kind") != VOICE_TRANSCRIPT_KIND:
+        return new_rendered
+    return DERIVED_BLOCK_RE.sub("", new_rendered) + "\n" + block.group(0).lstrip("\n")
 
 
 def encode_derived_payload(payload: dict[str, Any]) -> str:

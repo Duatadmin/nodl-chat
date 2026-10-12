@@ -8,7 +8,8 @@
 # nodl/derived_content.py.
 #
 # Flow: do_send_messages hook (message_send.py, NODL block) queues
-# {message_id, message_realm_id, path_ids} for every voice-note attachment →
+# {message_id, message_realm_id, path_ids} for every voice-note attachment
+# (the edit hook in message_edit.py adds `edited` for re-queued text) →
 # this worker mints presigned R2 GET URLs (AssemblyAI pulls the audio
 # directly; the client-visible /user_uploads/ path is auth-proxied and not
 # backend-fetchable) → POSTs to nodl-backend's internal derive endpoint,
@@ -137,6 +138,10 @@ class NodlDerivedContentWorker(QueueProcessingWorker):
                 "kind": "text_translation",
                 "text": text,
                 "sender_user_id": _sender_nodl_user_id(message),
+                # The edit hook (message_edit.py) tags its events: the
+                # backend re-translates edited text instead of ignoring it
+                # as a duplicate. Backends that predate the field ignore it.
+                "reason": "edit" if event.get("edited") else "send",
             }
 
         try:

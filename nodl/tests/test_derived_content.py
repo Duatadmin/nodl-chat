@@ -15,8 +15,11 @@ from nodl.derived_content import (
     DERIVED_BLOCK_RE,
     apply_derived_block,
     build_derived_block,
+    carry_voice_derived_block,
+    content_voice_note_path_ids,
     decode_derived_payload,
     encode_derived_payload,
+    translation_source_hash,
     translation_text,
     voice_note_path_ids,
 )
@@ -222,6 +225,89 @@ class DerivedBlockTest(unittest.TestCase):
         assert decoded is not None
         self.assertEqual(decoded["translations"], {"en": "hi"})
         self.assertIn("<p>привет</p>", second)
+
+
+VOICE_PATH = "2/ab/xyz/voice-1723500000.m4a"
+
+
+class ContentVoiceNotePathIdsTest(unittest.TestCase):
+    def test_finds_voice_links_in_raw_content(self) -> None:
+        content = (
+            f"[voice-1723500000.m4a](/user_uploads/{VOICE_PATH}) fixed the caption\n"
+            "[plan.pdf](/user_uploads/2/ab/xyz/plan.pdf)\n"
+            "https://chat.example/user_uploads/2/cd/q/voice-42.m4a?x=1"
+        )
+        self.assertEqual(content_voice_note_path_ids(content), [VOICE_PATH, "2/cd/q/voice-42.m4a"])
+
+    def test_text_and_other_uploads_have_none(self) -> None:
+        self.assertEqual(content_voice_note_path_ids("pour at 7, voice-1.m4a later"), [])
+        self.assertEqual(
+            content_voice_note_path_ids("[song.m4a](/user_uploads/2/ab/x/song.m4a)"), []
+        )
+
+
+class TranslationSourceHashTest(unittest.TestCase):
+    def test_is_hex_sha256_of_the_stripped_utf8_text(self) -> None:
+        import hashlib
+
+        expected = hashlib.sha256("Бетон в 8".encode()).hexdigest()
+        self.assertEqual(translation_source_hash("Бетон в 8"), expected)
+        self.assertEqual(translation_source_hash("  Бетон в 8 \n"), expected)
+        self.assertRegex(expected, r"^[0-9a-f]{64}$")
+
+
+class CarryVoiceDerivedBlockTest(unittest.TestCase):
+    """W0 P1: an edit re-renders from markdown and drops the appended block;
+    a voice note the edit keeps keeps its transcript and translations."""
+
+    VOICE_PAYLOAD = {
+        "v": 1,
+        "kind": "voice_transcript",
+        "transcript": "привет",
+        "translations": {"en": "hi"},
+    }
+    NEW_RENDER = f'<p><a href="/user_uploads/{VOICE_PATH}">voice-1723500000.m4a</a> fixed</p>'
+
+    def test_carries_the_block_when_the_voice_note_is_kept(self) -> None:
+        old = apply_derived_block(RENDERED, self.VOICE_PAYLOAD, "привет")
+        carried = carry_voice_derived_block(old, self.NEW_RENDER, [VOICE_PATH], [VOICE_PATH])
+
+        self.assertTrue(carried.startswith(self.NEW_RENDER))
+        self.assertEqual(DERIVED_BLOCK_RE.findall(carried), DERIVED_BLOCK_RE.findall(old))
+        self.assertIn("<p>привет</p>", carried)
+
+    def test_drops_the_block_when_the_voice_note_is_removed(self) -> None:
+        old = apply_derived_block(RENDERED, self.VOICE_PAYLOAD, "привет")
+        new_render = "<p>never mind</p>"
+
+        self.assertEqual(carry_voice_derived_block(old, new_render, [VOICE_PATH], []), new_render)
+        other_voice = "2/ab/xyz/voice-99.m4a"
+        self.assertEqual(
+            carry_voice_derived_block(old, new_render, [VOICE_PATH], [other_voice]), new_render
+        )
+
+    def test_never_carries_a_text_translation_block(self) -> None:
+        # Even beside a kept voice path: a text block translated the old text.
+        old = apply_derived_block(
+            RENDERED, {"v": 1, "kind": "text_translation", "translations": {"en": "a"}}, None
+        )
+        self.assertEqual(
+            carry_voice_derived_block(old, self.NEW_RENDER, [VOICE_PATH], [VOICE_PATH]),
+            self.NEW_RENDER,
+        )
+
+    def test_nothing_to_carry_without_a_block(self) -> None:
+        self.assertEqual(
+            carry_voice_derived_block(RENDERED, self.NEW_RENDER, [VOICE_PATH], [VOICE_PATH]),
+            self.NEW_RENDER,
+        )
+
+    def test_non_voice_attachments_are_not_voice_notes(self) -> None:
+        old = apply_derived_block(RENDERED, self.VOICE_PAYLOAD, "привет")
+        pdf = "2/ab/xyz/plan.pdf"
+        self.assertEqual(
+            carry_voice_derived_block(old, self.NEW_RENDER, [pdf], [pdf]), self.NEW_RENDER
+        )
 
 
 if __name__ == "__main__":
