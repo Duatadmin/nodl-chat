@@ -112,7 +112,15 @@ def get_message_stream_name_from_database(message: Message) -> str:
     up front in a more efficient manner.
     """
     stream_id = message.recipient.type_id
-    return Stream.objects.get(id=stream_id).name
+    # NODL MODIFICATION START - task chats push under their task title
+    # The payload's stream/channel_name feeds the iOS alert title (built here)
+    # and the Android title (built by the app), so substituting the display
+    # name fixes both without an app release; stream_id/channel_id are kept.
+    # The folder rides the same query (upstream tests count queries here).
+    from nodl.extensions.task_chats import push_channel_display_name
+
+    return push_channel_display_name(Stream.objects.select_related("folder").get(id=stream_id))
+    # NODL MODIFICATION END
 
 
 @dataclass

@@ -9,6 +9,7 @@ routine sync traffic, not user actions worth announcing in-channel.
 """
 
 import logging
+import re
 
 from django.db import IntegrityError, transaction
 from django.utils.timezone import now as timezone_now
@@ -24,10 +25,48 @@ logger = logging.getLogger(__name__)
 
 TASK_CHATS_FOLDER_NAME = "Task chats"
 
+# Push titles for task chats: one line on the lock screen.
+TASK_CHAT_PUSH_TITLE_MAX_LENGTH = 80
+# Shown when a task stream has no usable title — never its `task-<uuid>` name.
+TASK_CHAT_PUSH_FALLBACK_TITLE = "Task"
+# The description sync_task_stream writes when the task has no title.
+_PLACEHOLDER_DESCRIPTION_RE = re.compile(r"Task discussion [0-9a-fA-F-]{36}")
+
 
 def task_stream_description(task_title: str) -> str:
     """Normalize a task title into a valid single-line stream description."""
     return " ".join(task_title.split())[: Stream.MAX_DESCRIPTION_LENGTH]
+
+
+def is_task_chats_folder(folder: ChannelFolder | None) -> bool:
+    """Whether ``folder`` is the realm's "Task chats" folder.
+
+    Folder membership, not the stream name, identifies a task chat — the same
+    rule as the mobile client (lib/nodl/model/channel_display.dart).
+    """
+    return (
+        folder is not None
+        and not folder.is_archived
+        and folder.name.lower() == TASK_CHATS_FOLDER_NAME.lower()
+    )
+
+
+def push_channel_display_name(stream: Stream) -> str:
+    """The channel name a push notification shows for ``stream``.
+
+    Task chats show their task title (the stream description), collapsed to
+    one line and cut to TASK_CHAT_PUSH_TITLE_MAX_LENGTH, or "Task" when the
+    task has no title; every other stream keeps its name. Load the stream
+    with ``select_related("folder")`` so this costs no query.
+    """
+    if not is_task_chats_folder(stream.folder):
+        return stream.name
+    title = " ".join(stream.description.split())
+    if not title or _PLACEHOLDER_DESCRIPTION_RE.fullmatch(title):
+        return TASK_CHAT_PUSH_FALLBACK_TITLE
+    if len(title) > TASK_CHAT_PUSH_TITLE_MAX_LENGTH:
+        return title[: TASK_CHAT_PUSH_TITLE_MAX_LENGTH - 1].rstrip() + "…"
+    return title
 
 
 def get_or_create_task_chats_folder(realm: Realm) -> ChannelFolder:
