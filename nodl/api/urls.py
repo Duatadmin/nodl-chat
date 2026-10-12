@@ -10,6 +10,7 @@ from nodl.api.views.assistant import (
     update_assistant_card,
 )
 from nodl.api.views.derived import attach_derived_content
+from nodl.api.views.derived_candidates import list_translation_candidates
 from nodl.api.views.events import (
     events_view,
     register_queue,
@@ -105,6 +106,11 @@ urlpatterns = [
         "api/v1/internal/messages/<int:message_id>/derived",
         attach_derived_content,
         name="nodl_attach_derived_content",
+    ),
+    path(
+        "api/v1/internal/derived/candidates",
+        list_translation_candidates,
+        name="nodl_translation_candidates",
     ),
     # User REST API endpoints - authenticated via JWT
     # Presence endpoint - authenticated via JWT
