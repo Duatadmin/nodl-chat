@@ -13,8 +13,8 @@ run under the plain-pytest CI job. Fixtures mirror the REAL rendered shapes:
 import unittest
 
 from nodl.preview_text import (
-    contains_nodl_marker,
     defer_leading_mentions,
+    is_card_message,
     split_inline_images,
     strip_marker_text,
     strip_nodl_markers,
@@ -159,22 +159,24 @@ class StripMarkerTextTest(unittest.TestCase):
         self.assertEqual(strip_marker_text(text), text)
 
 
-class ContainsNodlMarkerTest(unittest.TestCase):
-    def test_every_marker_kind_is_detected(self) -> None:
+class IsCardMessageTest(unittest.TestCase):
+    def test_card_marker_first_is_a_card(self) -> None:
         for content in (
             "<!-- nodl-card:v1:eyJ4IjoxfQ== -->\n\nMissed call",
-            '<!-- meeting:{"room":"r"} -->\nJoin',
-            "<!--nodl-derived:v1:eyJ4IjoxfQ== -->",
-            'see <!-- file:{"path_id":"x"} -->',
-            "<!-- nodl-card:v1:eyJjYXJkX3R5cGUiOiAiY2FsbF9ldmVu",  # unterminated
+            "\n  <!--nodl-card:v1:eyJ4IjoxfQ== -->",
         ):
             with self.subTest(content=content):
-                self.assertTrue(contains_nodl_marker(content))
+                self.assertTrue(is_card_message(content))
 
-    def test_plain_text_and_foreign_comments_are_not_markers(self) -> None:
-        for content in ("Pour at 7", "before <!-- just a note --> after", "meeting: 9am"):
+    def test_anything_else_is_not_a_card(self) -> None:
+        for content in (
+            "Pour at 7",
+            '<!-- meeting:{"room":"r"} -->\nJoin',
+            "> quoted\n<!-- nodl-card:v1:eyJ4IjoxfQ== -->\nreply",
+            "before <!-- just a note --> after",
+        ):
             with self.subTest(content=content):
-                self.assertFalse(contains_nodl_marker(content))
+                self.assertFalse(is_card_message(content))
 
 
 if __name__ == "__main__":

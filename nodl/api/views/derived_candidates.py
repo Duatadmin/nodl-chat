@@ -20,7 +20,7 @@ POST /api/v1/internal/derived/candidates — service auth, read-only, two modes:
 Each item is classified the way the send hook classifies a new message:
 `voice_transcript` (links a voice note; the backend has the transcript, so
 no text travels) or `text_translation` (translation_text() is not None, so
-cards, meeting messages and other attachments are out).
+cards and other attachments are out, and nodl markers are stripped).
 """
 
 import json
@@ -48,13 +48,13 @@ from nodl.extensions.models import (
 )
 from zerver.lib.message import bulk_access_messages
 from zerver.lib.stream_subscription import get_subscribed_stream_recipient_ids_for_user
-from zerver.models import Message, UserMessage
+from zerver.models import Message, Realm, UserMessage, UserProfile
 
 logger = logging.getLogger(__name__)
 
 MAX_BACKFILL_ITEMS = 300
 MAX_SWEEP_MESSAGE_IDS = 200
-# Total text per back-fill page, in UTF-8 bytes.
+# Total text per response, in UTF-8 bytes (both modes).
 MAX_PAGE_TEXT_BYTES = 300_000
 # Rows scanned per back-fill item wanted: access checks and classification
 # drop some (photos, cards, protected history).
@@ -76,14 +76,42 @@ def _error(code: str, msg: str, status: int) -> JsonResponse:
     return JsonResponse({"result": "error", "code": code, "msg": msg}, status=status)
 
 
-def _classify(content: str) -> tuple[str | None, str | None]:
+def _classify(content: str, realm_host: str) -> tuple[str | None, str | None]:
     """(kind, text) for a message; (None, None) when it doesn't translate."""
-    if content_voice_note_path_ids(content):
+    if content_voice_note_path_ids(content, realm_host):
         return VOICE_TRANSCRIPT_KIND, None
     text = translation_text(content)
     if text is not None:
         return TEXT_TRANSLATION_KIND, text
     return None, None
+
+
+def _text_size(text: str | None) -> int:
+    return len(text.encode("utf-8")) if text else 0
+
+
+def _resolve_reader(realm: Realm, supabase_user_id: uuid.UUID) -> UserProfile | None:
+    """The realm's active user for a Supabase id: the realm-scoped mapping
+    first, then the legacy global one when its user lives in this realm
+    (task_streams._resolve_realm_user's rule)."""
+    mapping = (
+        NodlRealmUserExtension.objects.select_related("zulip_user")
+        .filter(zulip_realm=realm, supabase_user_id=supabase_user_id)
+        .first()
+    )
+    user: UserProfile | None = None
+    if mapping is not None and mapping.zulip_user.realm_id == realm.id:
+        user = mapping.zulip_user
+    else:
+        legacy = (
+            NodlUserExtension.objects.select_related("zulip_user")
+            .filter(supabase_user_id=supabase_user_id, zulip_user__realm=realm)
+            .first()
+        )
+        user = legacy.zulip_user if legacy is not None else None
+    if user is None or not user.is_active:
+        return None
+    return user
 
 
 def _supabase_ids_by_sender(sender_ids: set[int]) -> dict[int, str]:
@@ -108,27 +136,25 @@ def _supabase_ids_by_sender(sender_ids: set[int]) -> dict[int, str]:
     return found
 
 
-def _item(
-    message: Message, kind: str | None, text: str | None, senders: dict[int, str]
-) -> dict[str, Any]:
-    return {
-        "message_id": message.id,
-        "kind": kind,
-        "text": text,
-        "sender_supabase_user_id": senders.get(message.sender_id),
-        "date_sent": message.date_sent.isoformat(),
-    }
+def _items(picked: list[tuple[Message, str | None, str | None]]) -> list[dict[str, Any]]:
+    senders = _supabase_ids_by_sender({message.sender_id for message, _kind, _text in picked})
+    return [
+        {
+            "message_id": message.id,
+            "kind": kind,
+            "text": text,
+            "sender_supabase_user_id": senders.get(message.sender_id),
+            "date_sent": message.date_sent.isoformat(),
+        }
+        for message, kind, text in picked
+    ]
 
 
-def _backfill_candidates(realm_id: int, payload: CandidatesPayload) -> JsonResponse:
+def _backfill_candidates(realm: Realm, payload: CandidatesPayload) -> JsonResponse:
     """Mode A: the reader's recent translatable messages, newest first."""
-    mapping = (
-        NodlRealmUserExtension.objects.select_related("zulip_user")
-        .filter(zulip_realm_id=realm_id, supabase_user_id=payload.supabase_user_id)
-        .first()
-    )
-    reader = mapping.zulip_user if mapping is not None else None
-    if reader is None or not reader.is_active or reader.realm_id != realm_id:
+    assert payload.supabase_user_id is not None
+    reader = _resolve_reader(realm, payload.supabase_user_id)
+    if reader is None:
         return _error("USER_NOT_FOUND", "User not found in this workspace", 404)
 
     assert payload.since is not None
@@ -141,7 +167,7 @@ def _backfill_candidates(realm_id: int, payload: CandidatesPayload) -> JsonRespo
         message__date_sent__gte=since,
     ).values("message_id")
     candidates = (
-        Message.objects.filter(realm_id=realm_id, date_sent__gte=since)
+        Message.objects.filter(realm_id=realm.id, date_sent__gte=since)
         .filter(
             Q(recipient_id__in=get_subscribed_stream_recipient_ids_for_user(reader))
             | Q(id__in=received_dm_ids)
@@ -157,16 +183,16 @@ def _backfill_candidates(realm_id: int, payload: CandidatesPayload) -> JsonRespo
         message.id for message in bulk_access_messages(reader, scanned, is_modifying_message=False)
     }
 
-    picked: list[tuple[Message, str, str | None]] = []
+    picked: list[tuple[Message, str | None, str | None]] = []
     text_bytes = 0
     # The last row fully handled (picked or skipped): the next page starts below it.
     cursor: int | None = None
     more = len(scanned) == window
     for message in scanned:
         if message.id in accessible_ids:
-            kind, text = _classify(message.content)
+            kind, text = _classify(message.content, realm.host)
             if kind is not None:
-                size = len(text.encode("utf-8")) if text else 0
+                size = _text_size(text)
                 if picked and text_bytes + size > MAX_PAGE_TEXT_BYTES:
                     more = True
                     break
@@ -177,34 +203,41 @@ def _backfill_candidates(realm_id: int, payload: CandidatesPayload) -> JsonRespo
             more = True
             break
 
-    senders = _supabase_ids_by_sender({message.sender_id for message, _kind, _text in picked})
     return JsonResponse(
         {
             "result": "success",
-            "items": [_item(message, kind, text, senders) for message, kind, text in picked],
+            "items": _items(picked),
             "next_before_message_id": cursor if more else None,
         }
     )
 
 
-def _sweep_candidates(realm_id: int, message_ids: list[int]) -> JsonResponse:
-    """Mode B: current kind and text for known ids; deleted ids are absent.
+def _sweep_candidates(realm: Realm, message_ids: list[int]) -> JsonResponse:
+    """Mode B: current kind and text for known ids, ascending; deleted ids
+    are absent.
 
     `kind` is null for a message that no longer translates (edited into a
-    photo, a card or a meeting message).
+    photo or a card). Over the text cap the list stops early with
+    `truncated: true`: ask again for the ids after the last one returned.
     """
-    messages = list(
-        Message.objects.filter(realm_id=realm_id, id__in=set(message_ids))
+    messages = (
+        Message.objects.filter(realm_id=realm.id, id__in=set(message_ids))
         .only("id", "content", "sender_id", "date_sent")
         .order_by("id")
     )
-    senders = _supabase_ids_by_sender({message.sender_id for message in messages})
-    return JsonResponse(
-        {
-            "result": "success",
-            "items": [_item(message, *_classify(message.content), senders) for message in messages],
-        }
-    )
+    picked: list[tuple[Message, str | None, str | None]] = []
+    text_bytes = 0
+    truncated = False
+    for message in messages:
+        kind, text = _classify(message.content, realm.host)
+        size = _text_size(text)
+        if picked and text_bytes + size > MAX_PAGE_TEXT_BYTES:
+            truncated = True
+            break
+        picked.append((message, kind, text))
+        text_bytes += size
+
+    return JsonResponse({"result": "success", "items": _items(picked), "truncated": truncated})
 
 
 @csrf_exempt  # type: ignore[untyped-decorator]
@@ -215,8 +248,13 @@ def list_translation_candidates(request: HttpRequest) -> HttpResponse:
     POST /api/v1/internal/derived/candidates
     Mode A: {workspace_id, supabase_user_id, since, limit?<=300, before_message_id?}
         -> {items, next_before_message_id}
-    Mode B: {workspace_id, message_ids<=200} -> {items}
+    Mode B: {workspace_id, message_ids<=200} -> {items, truncated}
     Items: {message_id, kind, text, sender_supabase_user_id, date_sent}.
+
+    Mode A pages newest first: send `next_before_message_id` back as
+    `before_message_id` until it is null. A page can hold no items and still
+    carry a cursor (every scanned row was a photo, a card, or out of the
+    reader's reach), so an empty page is not the end — a null cursor is.
 
     An unknown workspace, or a user who isn't an active member of it, is 404.
     """
@@ -246,7 +284,8 @@ def list_translation_candidates(request: HttpRequest) -> HttpResponse:
     if extension is None or extension.zulip_realm.deactivated:
         return _error("WORKSPACE_NOT_FOUND", "Workspace not found", 404)
 
+    realm = extension.zulip_realm
     if sweep:
         assert payload.message_ids is not None
-        return _sweep_candidates(extension.zulip_realm_id, payload.message_ids)
-    return _backfill_candidates(extension.zulip_realm_id, payload)
+        return _sweep_candidates(realm, payload.message_ids)
+    return _backfill_candidates(realm, payload)

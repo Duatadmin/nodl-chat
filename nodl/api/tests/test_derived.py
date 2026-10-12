@@ -11,6 +11,7 @@ Real realm, users and messages; the edits go through check_update_message,
 the path every client edit takes.
 """
 
+import base64
 import json
 import uuid
 from typing import Any
@@ -36,6 +37,19 @@ from zerver.lib.streams import create_stream_if_needed
 from zerver.models import Attachment, Message, Realm, Stream, UserProfile
 from zerver.models.clients import get_client
 from zerver.worker.nodl_derived_content import NodlDerivedContentWorker
+
+# A human-sent card (call_event is sent as the caller): marker first.
+CARD_CONTENT = (
+    "<!-- nodl-card:v1:"
+    + base64.urlsafe_b64encode(
+        json.dumps({"card_type": "call_event", "payload": {"call_id": "c"}}).encode()
+    ).decode("ascii")
+    + " -->\n\nMissed call"
+)
+MEETING_CONTENT = (
+    '<!-- meeting:{"room":"site-standup","title":"Slab B pour review"} -->\n'
+    "**Slab B pour review**\nJoin the video meeting: [Click to Join](https://meet.example/r)"
+)
 
 
 def _payload_of(rendered: str) -> dict[str, Any] | None:
@@ -146,11 +160,59 @@ class TestEditRequeue(DerivedEditTestCase):
     def test_card_edit_queues_nothing(self, mock_queue: MagicMock) -> None:
         message_id = self._send("Pour at 7")
 
-        check_update_message(
-            self.sender, message_id, content='<!-- meeting:{"room":"r"} -->\nJoin at 9'
-        )
+        check_update_message(self.sender, message_id, content=CARD_CONTENT)
 
         self.assertNotIn("nodl_derived_content", [c.args[0] for c in mock_queue.call_args_list])
+
+
+class TestUnchangedTextEdit(DerivedEditTestCase):
+    """An edit that leaves the translatable text as it was keeps the
+    translation block and asks the backend for nothing."""
+
+    TRANSLATIONS = {"ru": "Заливка в 7"}
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.message_id = self._send("Pour at 7")
+        response = self._attach(
+            self.message_id,
+            {
+                "kind": "text_translation",
+                "source_lang": "en",
+                "translations": self.TRANSLATIONS,
+                "source_hash": translation_source_hash("Pour at 7"),
+            },
+        )
+        self.assertEqual(response.status_code, 200, response.content)
+
+    @patch("zerver.actions.message_edit.queue_event_on_commit")
+    @patch("zerver.actions.message_edit.send_event_on_commit")
+    def test_identical_edit_keeps_the_block_and_queues_nothing(
+        self, mock_send_event: MagicMock, mock_queue: MagicMock
+    ) -> None:
+        for content in ("Pour at 7", "\n\nPour at 7   "):
+            with self.subTest(content=content):
+                check_update_message(self.sender, self.message_id, content=content)
+
+                rendered = self._rendered(self.message_id)
+                payload = _payload_of(rendered)
+                assert payload is not None
+                self.assertEqual(payload["translations"], self.TRANSLATIONS)
+                self.assertEqual(len(DERIVED_BLOCK_RE.findall(rendered)), 1)
+                edit_event = mock_send_event.call_args_list[-1].args[1]
+                self.assertEqual(edit_event["rendered_content"], rendered)
+        self.assertNotIn("nodl_derived_content", [c.args[0] for c in mock_queue.call_args_list])
+
+    @patch("zerver.actions.message_edit.queue_event_on_commit")
+    def test_real_edit_drops_the_block_and_queues_an_edit(self, mock_queue: MagicMock) -> None:
+        check_update_message(self.sender, self.message_id, content="Pour at 8")
+
+        self.assertIsNone(_payload_of(self._rendered(self.message_id)))
+        events = [
+            c.args[1] for c in mock_queue.call_args_list if c.args[0] == "nodl_derived_content"
+        ]
+        self.assertEqual(len(events), 1)
+        self.assertIs(events[0]["edited"], True)
 
 
 @override_settings(NODL_BACKEND_URL="http://backend.test", BACKEND_SERVICE_KEY="test-key")
@@ -175,6 +237,16 @@ class TestWorkerForwardsReason(DerivedEditTestCase):
         edited = self._forwarded({**event, "edited": True})
         self.assertEqual(edited["reason"], "edit")
         self.assertEqual(edited["text"], "Pour at 7")
+
+    def test_meeting_message_forwards_its_text_without_the_marker(self) -> None:
+        message_id = self._send(MEETING_CONTENT)
+        body = self._forwarded(
+            {"message_id": message_id, "message_realm_id": self.realm.id, "path_ids": []}
+        )
+
+        self.assertTrue(body["text"].startswith("**Slab B pour review**"))
+        self.assertNotIn("<!--", body["text"])
+        self.assertNotIn('"room"', body["text"])
 
 
 class TestVoiceEditKeepsDerivedBlock(DerivedEditTestCase):
@@ -269,13 +341,22 @@ class TestAttachSourceHash(DerivedEditTestCase):
     def test_text_no_longer_translatable_is_409(self) -> None:
         message_id = self._send("Pour at 7")
         source_hash = translation_source_hash("Pour at 7")
-        check_update_message(
-            self.sender, message_id, content='<!-- meeting:{"room":"r"} -->\nJoin at 9'
-        )
+        check_update_message(self.sender, message_id, content=CARD_CONTENT)
 
         response = self._text_attach(message_id, source_hash)
 
         self.assertEqual(response.status_code, 409, response.content)
+
+    def test_marker_message_hashes_the_text_without_the_marker(self) -> None:
+        # The worker forwards translation_text(), markers stripped; the
+        # backend hashes that, and the attach check recomputes the same.
+        message_id = self._send(MEETING_CONTENT)
+        forwarded_text = "**Slab B pour review**\nJoin the video meeting: [Click to Join](https://meet.example/r)"
+
+        stale = self._text_attach(message_id, translation_source_hash(MEETING_CONTENT))
+        self.assertEqual(stale.status_code, 409, stale.content)
+        response = self._text_attach(message_id, translation_source_hash(forwarded_text))
+        self.assertEqual(response.status_code, 200, response.content)
 
     def test_without_hash_attaches_as_before(self) -> None:
         # Backends that predate source_hash keep today's behavior.

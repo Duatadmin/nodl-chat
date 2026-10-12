@@ -1686,17 +1686,30 @@ def check_update_message(
             )
 
     # NODL MODIFICATION START — the re-render above drops the derived block
-    # nodl appended to a voice note (transcript + translations). An edit that
-    # keeps the voice note keeps its audio, so carry the old block into the
-    # new render; it then reaches the row and the edit event together.
+    # nodl appended (a voice note's transcript + translations, or a text
+    # message's translations). An edit that keeps the voice note keeps its
+    # audio, and one that leaves the translatable text as it was keeps its
+    # translation, so carry the old block into the new render; it then
+    # reaches the row and the edit event together.
     if rendering_result is not None:
-        from nodl.derived_content import carry_voice_derived_block, content_voice_note_path_ids
+        from nodl.derived_content import (
+            carry_text_derived_block,
+            carry_voice_derived_block,
+            content_voice_note_path_ids,
+        )
 
+        old_rendered_content = message.rendered_content or ""
         rendering_result.rendered_content = carry_voice_derived_block(
-            message.rendered_content or "",
+            old_rendered_content,
             rendering_result.rendered_content,
-            content_voice_note_path_ids(message.content),
+            content_voice_note_path_ids(message.content, user_profile.realm.host),
             rendering_result.potential_attachment_path_ids,
+        )
+        rendering_result.rendered_content = carry_text_derived_block(
+            old_rendered_content,
+            rendering_result.rendered_content,
+            message.content,
+            message_edit_request.content,
         )
     # NODL MODIFICATION END
 
@@ -1729,16 +1742,19 @@ def check_update_message(
     # translation candidate under the same scope rules (human sender, plain
     # text, no attachment references). `edited` tells the backend this is an
     # edit, so it re-translates new text instead of ignoring a duplicate.
-    # Voice notes are deliberately excluded: they carry /user_uploads
-    # references, re-transcription on edit would re-bill AssemblyAI for
-    # content that didn't change, and their block is carried over above.
+    # An edit that left the translatable text as it was isn't re-queued; its
+    # block is carried over above. Voice notes are deliberately excluded:
+    # they carry /user_uploads references, re-transcription on edit would
+    # re-bill AssemblyAI for content that didn't change, and their block is
+    # carried over above too.
     if message_edit_request.is_content_edited and rendering_result is not None:
-        from nodl.derived_content import translation_text
+        from nodl.derived_content import same_translation_source, translation_text
 
         if (
             not message.sender.is_bot
             and not rendering_result.potential_attachment_path_ids
             and translation_text(message.content) is not None
+            and not same_translation_source(message_edit_request.orig_content, message.content)
         ):
             queue_event_on_commit(
                 "nodl_derived_content",

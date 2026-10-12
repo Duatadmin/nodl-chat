@@ -28,7 +28,7 @@ from typing import Any
 
 from django.utils.html import escape
 
-from nodl.preview_text import contains_nodl_marker
+from nodl.preview_text import is_card_message, strip_marker_text
 
 DERIVED_PAYLOAD_VERSION = 1
 
@@ -40,9 +40,13 @@ TEXT_TRANSLATION_KIND = "text_translation"
 # (`voice-<epoch-ms>.m4a`). path_ids look like "2/ab/xyz/voice-1723500000.m4a".
 VOICE_NOTE_PATH_ID_RE = re.compile(r"(?:^|/)voice-\d+\.m4a$")
 
-# An upload path_id referenced from raw message content: a relative
-# `/user_uploads/<path_id>` link target or the same path on an absolute URL.
-_CONTENT_UPLOAD_PATH_RE = re.compile(r"/user_uploads/([^\s()\[\]<>\"'?#]+)")
+# An upload link in raw message content: an absolute URL (its host captured)
+# or a relative `/user_uploads/` (or `user_uploads/`) path that starts a
+# token or a link target — not the tail of some other URL.
+_CONTENT_UPLOAD_LINK_RE = re.compile(
+    r"(?:https?://(?P<host>[^/\s()\[\]<>\"']+)|(?<![^\s(\[<\"']))"
+    r"/?user_uploads/(?P<path_id>[^\s()\[\]<>\"'?#]+)"
+)
 
 # The payload comment of a derived block (the block regex below includes it).
 _DERIVED_PAYLOAD_RE = re.compile(r"<!--\s*nodl-derived:v1:([A-Za-z0-9_=-]+)\s*-->")
@@ -66,9 +70,18 @@ def voice_note_path_ids(path_ids: Iterable[str]) -> list[str]:
     return [p for p in path_ids if VOICE_NOTE_PATH_ID_RE.search(p)]
 
 
-def content_voice_note_path_ids(content: str) -> list[str]:
-    """The voice-note uploads a message's raw content links to."""
-    return voice_note_path_ids(_CONTENT_UPLOAD_PATH_RE.findall(content))
+def content_voice_note_path_ids(content: str, realm_host: str) -> list[str]:
+    """The voice-note uploads a message's raw content links to.
+
+    Links count the way markdown counts attachments (zerver/lib/markdown
+    maybe_add_attachment_path_id): a relative path, or an absolute URL on the
+    message realm's own host.
+    """
+    return voice_note_path_ids(
+        link["path_id"]
+        for link in _CONTENT_UPLOAD_LINK_RE.finditer(content)
+        if link["host"] is None or link["host"].lower() == realm_host.lower()
+    )
 
 
 def translation_text(content: str) -> str | None:
@@ -77,15 +90,16 @@ def translation_text(content: str) -> str | None:
     V3 scope (founder 2026-08-13): only voice notes and PLAIN TEXT messages
     are translated. Any /user_uploads reference marks the message as an
     attachment message (image, document, pasted upload link) — those are
-    skipped entirely, captions included. So is any message carrying a nodl
-    machine marker (cards such as call_event, meeting messages): those are
-    data the clients word themselves, and their payload must never reach
-    the translator.
+    skipped entirely, captions included. A card message (nodl-card marker
+    first, e.g. call_event) is data the clients word themselves and is
+    skipped too. Anywhere else a nodl marker is stripped and the rest
+    translates — the title typed into a meeting message, or a reply that
+    quotes a card — so no marker payload ever reaches the translator.
     """
     text = content.strip()
-    if not text or "/user_uploads/" in text or contains_nodl_marker(text):
+    if not text or "/user_uploads/" in text or is_card_message(text):
         return None
-    return text
+    return strip_marker_text(text).strip() or None
 
 
 def translation_source_hash(text: str) -> str:
@@ -96,6 +110,26 @@ def translation_source_hash(text: str) -> str:
     to the backend, so both sides hash the same string.
     """
     return hashlib.sha256(text.strip().encode("utf-8")).hexdigest()
+
+
+def same_translation_source(old_content: str, new_content: str) -> bool:
+    """Whether an edit left a message's translatable text as it was (an
+    identical or whitespace-only edit, or one that changed only a marker)."""
+    old_text = translation_text(old_content)
+    return old_text is not None and old_text == translation_text(new_content)
+
+
+def _carry_block(old_rendered: str, new_rendered: str, kind: str) -> str:
+    """Append ``old_rendered``'s derived block to ``new_rendered`` if it is a
+    block of ``kind``."""
+    block = DERIVED_BLOCK_RE.search(old_rendered)
+    if block is None:
+        return new_rendered
+    payload_comment = _DERIVED_PAYLOAD_RE.search(block.group(0))
+    payload = decode_derived_payload(payload_comment.group(1)) if payload_comment else None
+    if payload is None or payload.get("kind") != kind:
+        return new_rendered
+    return DERIVED_BLOCK_RE.sub("", new_rendered) + "\n" + block.group(0).lstrip("\n")
 
 
 def carry_voice_derived_block(
@@ -111,19 +145,22 @@ def carry_voice_derived_block(
     old one linked, the audio is unchanged, so its transcript and
     translations stay valid: the old block is appended to the new render
     (no re-transcription, no re-bill, and the edit event already carries
-    it). A text-translation block is never carried: the edit changed the
-    text it translated.
+    it). Only a voice block is carried here.
     """
     if not set(voice_note_path_ids(old_paths)) & set(voice_note_path_ids(new_paths)):
         return new_rendered
-    block = DERIVED_BLOCK_RE.search(old_rendered)
-    if block is None:
+    return _carry_block(old_rendered, new_rendered, VOICE_TRANSCRIPT_KIND)
+
+
+def carry_text_derived_block(
+    old_rendered: str, new_rendered: str, old_content: str, new_content: str
+) -> str:
+    """Keep a text message's translation block across an edit that left its
+    translatable text as it was; any real change drops it (the backend
+    re-translates the edited text)."""
+    if not same_translation_source(old_content, new_content):
         return new_rendered
-    payload_comment = _DERIVED_PAYLOAD_RE.search(block.group(0))
-    payload = decode_derived_payload(payload_comment.group(1)) if payload_comment else None
-    if payload is None or payload.get("kind") != VOICE_TRANSCRIPT_KIND:
-        return new_rendered
-    return DERIVED_BLOCK_RE.sub("", new_rendered) + "\n" + block.group(0).lstrip("\n")
+    return _carry_block(old_rendered, new_rendered, TEXT_TRANSLATION_KIND)
 
 
 def encode_derived_payload(payload: dict[str, Any]) -> str:

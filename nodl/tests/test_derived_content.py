@@ -15,10 +15,12 @@ from nodl.derived_content import (
     DERIVED_BLOCK_RE,
     apply_derived_block,
     build_derived_block,
+    carry_text_derived_block,
     carry_voice_derived_block,
     content_voice_note_path_ids,
     decode_derived_payload,
     encode_derived_payload,
+    same_translation_source,
     translation_source_hash,
     translation_text,
     voice_note_path_ids,
@@ -78,9 +80,13 @@ class TranslationTextTest(unittest.TestCase):
         )
 
 
+MEETING_MARKER = '<!-- meeting:{"room":"site-standup","title":"Slab B pour review"} -->'
+
+
 class TranslationTextMarkerTest(unittest.TestCase):
-    """W0 P5a: nodl machine markers are data the clients word themselves —
-    their payload (base64 or JSON) must never reach the translator."""
+    """W0 P5a: a card message is data the clients word themselves and never
+    translates; elsewhere nodl markers are stripped, so their payload (base64
+    or JSON) never reaches the translator but the human text around it does."""
 
     def test_call_event_card_is_skipped(self) -> None:
         # Sent with the human caller as sender, so the bot filter misses it.
@@ -99,17 +105,47 @@ class TranslationTextMarkerTest(unittest.TestCase):
         )
         self.assertIsNone(translation_text(content))
 
-    def test_meeting_marker_is_skipped(self) -> None:
-        # Human-sent from the web composer; no /user_uploads reference.
+    def test_meeting_message_translates_its_title_without_the_json(self) -> None:
+        # The web composer's meeting message: the title is typed by a human.
         content = (
-            '<!-- meeting:{"room":"site-standup","title":"Standup"} -->\nJoin the meeting at 9'
+            f"{MEETING_MARKER}\n**Slab B pour review**\n"
+            "Join the video meeting: [Click to Join](https://meet.nodle.tech/site-standup)"
         )
-        self.assertIsNone(translation_text(content))
+        self.assertEqual(
+            translation_text(content),
+            "**Slab B pour review**\n"
+            "Join the video meeting: [Click to Join](https://meet.nodle.tech/site-standup)",
+        )
 
-    def test_every_marker_prefix_is_skipped(self) -> None:
-        for prefix in ("nodl-card:v1:", "meeting:", "nodl-derived:v1:", "file:"):
+    def test_quote_reply_of_a_card_translates_the_reply_without_the_marker(self) -> None:
+        card = build_card_message_content(
+            "call_event",
+            {"call_id": "c-1", "status": "missed", "caller_id": 7, "callee_id": 9},
+            "Missed call",
+        )
+        content = (
+            "@_**Made Manager|7** [said](#narrow/dm/7-9/near/42):\n"
+            f"```quote\n{card}\n```\nSorry, I was on the scaffold — calling back now"
+        )
+
+        text = translation_text(content)
+
+        assert text is not None
+        self.assertNotIn("nodl-card", text)
+        self.assertNotIn("<!--", text)
+        self.assertTrue(text.startswith("@_**Made Manager|7** [said]"))
+        self.assertTrue(text.endswith("calling back now"))
+        self.assertIn("Missed call", text)
+
+    def test_only_a_card_marker_first_makes_a_card(self) -> None:
+        self.assertIsNone(translation_text("  \n<!--nodl-card:v1:eyJ4IjoxfQ== -->\nhi"))
+        for prefix in ("meeting:", "nodl-derived:v1:", "file:"):
             with self.subTest(prefix=prefix):
-                self.assertIsNone(translation_text(f"<!--{prefix}eyJ4IjoxfQ== -->\nhi"))
+                self.assertEqual(translation_text(f"<!--{prefix}eyJ4IjoxfQ== -->\nhi"), "hi")
+
+    def test_nothing_left_after_the_markers_is_none(self) -> None:
+        self.assertIsNone(translation_text(MEETING_MARKER))
+        self.assertIsNone(translation_text(f"{MEETING_MARKER}\n  "))
 
     def test_plain_text_still_translates(self) -> None:
         self.assertEqual(translation_text("Pour tomorrow at 7"), "Pour tomorrow at 7")
@@ -230,19 +266,40 @@ class DerivedBlockTest(unittest.TestCase):
 VOICE_PATH = "2/ab/xyz/voice-1723500000.m4a"
 
 
+REALM_HOST = "ws1.chat.example"
+
+
 class ContentVoiceNotePathIdsTest(unittest.TestCase):
-    def test_finds_voice_links_in_raw_content(self) -> None:
+    def test_finds_relative_and_realm_host_voice_links(self) -> None:
         content = (
             f"[voice-1723500000.m4a](/user_uploads/{VOICE_PATH}) fixed the caption\n"
             "[plan.pdf](/user_uploads/2/ab/xyz/plan.pdf)\n"
-            "https://chat.example/user_uploads/2/cd/q/voice-42.m4a?x=1"
+            "https://WS1.chat.example/user_uploads/2/cd/q/voice-42.m4a?x=1\n"
+            "[v](user_uploads/2/ef/r/voice-7.m4a)"
         )
-        self.assertEqual(content_voice_note_path_ids(content), [VOICE_PATH, "2/cd/q/voice-42.m4a"])
+        self.assertEqual(
+            content_voice_note_path_ids(content, REALM_HOST),
+            [VOICE_PATH, "2/cd/q/voice-42.m4a", "2/ef/r/voice-7.m4a"],
+        )
+
+    def test_links_on_other_hosts_are_not_attachments(self) -> None:
+        # As in markdown: only this realm's uploads are the message's own.
+        for content in (
+            "https://other.example/user_uploads/2/ab/x/voice-1.m4a",
+            "[v](https://ws1.chat.example.evil/user_uploads/2/ab/x/voice-1.m4a)",
+            "//other.example/user_uploads/2/ab/x/voice-1.m4a",
+            "https://other.example/files/user_uploads/2/ab/x/voice-1.m4a",
+        ):
+            with self.subTest(content=content):
+                self.assertEqual(content_voice_note_path_ids(content, REALM_HOST), [])
 
     def test_text_and_other_uploads_have_none(self) -> None:
-        self.assertEqual(content_voice_note_path_ids("pour at 7, voice-1.m4a later"), [])
         self.assertEqual(
-            content_voice_note_path_ids("[song.m4a](/user_uploads/2/ab/x/song.m4a)"), []
+            content_voice_note_path_ids("pour at 7, voice-1.m4a later", REALM_HOST), []
+        )
+        self.assertEqual(
+            content_voice_note_path_ids("[song.m4a](/user_uploads/2/ab/x/song.m4a)", REALM_HOST),
+            [],
         )
 
 
@@ -307,6 +364,50 @@ class CarryVoiceDerivedBlockTest(unittest.TestCase):
         pdf = "2/ab/xyz/plan.pdf"
         self.assertEqual(
             carry_voice_derived_block(old, self.NEW_RENDER, [pdf], [pdf]), self.NEW_RENDER
+        )
+
+
+class CarryTextDerivedBlockTest(unittest.TestCase):
+    """An edit that leaves the translatable text as it was keeps the text
+    message's translations; any real change drops them."""
+
+    TEXT_PAYLOAD = {"v": 1, "kind": "text_translation", "translations": {"ru": "Заливка в 7"}}
+    OLD_RENDER = apply_derived_block("<p>Pour at 7</p>", TEXT_PAYLOAD, None)
+
+    def test_same_translation_source(self) -> None:
+        self.assertTrue(same_translation_source("Pour at 7", "Pour at 7"))
+        self.assertTrue(same_translation_source("Pour at 7", "  Pour at 7\n"))
+        # A marker change leaves the text to translate as it was.
+        self.assertTrue(
+            same_translation_source(f"{MEETING_MARKER}\nStandup", "<!-- meeting:{} -->\nStandup")
+        )
+        self.assertFalse(same_translation_source("Pour at 7", "Pour at 8"))
+        # Nothing to translate on either side is never "the same source".
+        self.assertFalse(same_translation_source("", ""))
+        card = build_card_message_content("call_event", {"call_id": "c"}, "Missed call")
+        self.assertFalse(same_translation_source(card, card))
+
+    def test_carries_the_block_when_the_text_is_unchanged(self) -> None:
+        carried = carry_text_derived_block(
+            self.OLD_RENDER, "<p>Pour at 7</p>", "Pour at 7", "Pour at 7 "
+        )
+
+        self.assertTrue(carried.startswith("<p>Pour at 7</p>"))
+        self.assertEqual(
+            DERIVED_BLOCK_RE.findall(carried), DERIVED_BLOCK_RE.findall(self.OLD_RENDER)
+        )
+
+    def test_drops_the_block_when_the_text_changed(self) -> None:
+        self.assertEqual(
+            carry_text_derived_block(self.OLD_RENDER, "<p>Pour at 8</p>", "Pour at 7", "Pour at 8"),
+            "<p>Pour at 8</p>",
+        )
+
+    def test_never_carries_a_voice_block(self) -> None:
+        old = apply_derived_block(RENDERED, {"v": 1, "kind": "voice_transcript"}, "привет")
+        self.assertEqual(
+            carry_text_derived_block(old, "<p>Pour at 7</p>", "Pour at 7", "Pour at 7"),
+            "<p>Pour at 7</p>",
         )
 
 

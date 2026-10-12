@@ -131,6 +131,14 @@ class TranslationRequeueTest(unittest.TestCase):
         self.assertIn("carry_voice_derived_block(", src)
         self.assertLess(src.index("carry_voice_derived_block("), src.index("do_update_message("))
 
+    def test_unchanged_text_edit_keeps_its_translation(self) -> None:
+        # An identical or whitespace-only edit carries the text block into
+        # the new render and asks the backend for nothing.
+        src = _function_source(MESSAGE_EDIT_ACTIONS_PY, "check_update_message")
+        self.assertIn("carry_text_derived_block(", src)
+        self.assertLess(src.index("carry_text_derived_block("), src.index("do_update_message("))
+        self.assertIn("not same_translation_source(", src)
+
 
 class RealmWindowDefaultsTest(unittest.TestCase):
     def test_whatsapp_model_windows(self) -> None:

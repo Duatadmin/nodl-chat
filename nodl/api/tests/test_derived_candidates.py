@@ -18,7 +18,12 @@ from django.test import RequestFactory, TestCase
 from django.utils.timezone import now as timezone_now
 
 from nodl.api.views.derived_candidates import list_translation_candidates
-from nodl.extensions.models import NodlRealmExtension, NodlRealmUserExtension, SyncStatus
+from nodl.extensions.models import (
+    NodlRealmExtension,
+    NodlRealmUserExtension,
+    NodlUserExtension,
+    SyncStatus,
+)
 from zerver.actions.create_realm import do_create_realm
 from zerver.actions.create_user import do_create_user
 from zerver.actions.message_delete import do_delete_messages
@@ -239,6 +244,36 @@ class TestCandidatesRequest(CandidatesTestCase):
             with self.subTest(label):
                 self.assertEqual(self._call(body).status_code, 404)
 
+    def test_legacy_mapping_resolves_only_inside_the_realm(self) -> None:
+        # Users provisioned before realm-scoped mappings have only the global
+        # NodlUserExtension row; it counts when its user lives in this realm.
+        legacy_reader = do_create_user(
+            email=f"{uuid.uuid4().hex[:12]}@example.com",
+            password=None,
+            realm=self.realm,
+            full_name="Legacy Reader",
+            acting_user=None,
+        )
+        legacy_supabase_id = uuid.uuid4()
+        NodlUserExtension.objects.create(
+            zulip_user=legacy_reader, supabase_user_id=legacy_supabase_id
+        )
+        stream = self._stream([legacy_reader, self.alice])
+        posted = self._post(self.alice, stream)
+        other_realm, other_workspace_id = self._make_realm("Other")
+
+        ids = self._backfill_ids(supabase_user_id=str(legacy_supabase_id))
+        elsewhere = self._call(
+            {
+                "workspace_id": str(other_workspace_id),
+                "supabase_user_id": str(legacy_supabase_id),
+                "since": self.since.isoformat(),
+            }
+        )
+
+        self.assertEqual(ids, [posted])
+        self.assertEqual(elsewhere.status_code, 404)
+
 
 class TestBackfillScope(CandidatesTestCase):
     def test_returns_the_readers_chats_only(self) -> None:
@@ -263,6 +298,7 @@ class TestBackfillScope(CandidatesTestCase):
             self.assertNotIn(excluded, ids)
 
     def test_excludes_own_bot_card_attachment_and_deleted_messages(self) -> None:
+        # A meeting message stays in: its marker is stripped, its text goes.
         stream = self._stream([self.reader, self.alice])
         bot, _ = self._make_user(self.realm, "Nodle Assistant", bot_type=UserProfile.DEFAULT_BOT)
         self._subscribe(stream, [bot])
@@ -284,11 +320,12 @@ class TestBackfillScope(CandidatesTestCase):
         deleted = self._post(self.alice, stream, "wrong chat")
         do_delete_messages(self.realm, list(Message.objects.filter(id=deleted)), acting_user=None)
 
-        ids = self._backfill_ids()
+        items = self._backfill()["items"]
 
-        self.assertEqual(ids, [kept])
-        for excluded in (own, from_bot, card, meeting, photo, deleted):
-            self.assertNotIn(excluded, ids)
+        self.assertEqual([item["message_id"] for item in items], [meeting, kept])
+        self.assertEqual(items[0]["text"], "Join at 9")
+        for excluded in (own, from_bot, card, photo, deleted):
+            self.assertNotIn(excluded, [item["message_id"] for item in items])
 
     def test_items_carry_kind_text_sender_and_date(self) -> None:
         stream = self._stream([self.reader, self.alice])
@@ -306,6 +343,20 @@ class TestBackfillScope(CandidatesTestCase):
         self.assertEqual(items[text_id]["date_sent"], sent.isoformat())
         self.assertEqual(items[voice_id]["kind"], "voice_transcript")
         self.assertIsNone(items[voice_id]["text"])
+
+    def test_an_empty_page_can_carry_a_cursor(self) -> None:
+        # Every scanned row is a photo: no items, but more rows remain.
+        stream = self._stream([self.reader, self.alice])
+        text = self._post(self.alice, stream, "Pour at 7")
+        for _ in range(2):
+            self._post(self.alice, stream, self._upload_link(self.alice, "a.jpg", "image/jpeg"))
+
+        empty = self._backfill(limit=1)
+        last = self._backfill(limit=1, before_message_id=empty["next_before_message_id"])
+
+        self.assertEqual(empty["items"], [])
+        self.assertIsNotNone(empty["next_before_message_id"])
+        self.assertEqual([item["message_id"] for item in last["items"]], [text])
 
     def test_messages_before_since_are_out(self) -> None:
         stream = self._stream([self.reader, self.alice])
@@ -380,9 +431,9 @@ class TestSweep(CandidatesTestCase):
         voice = self._post(
             self.alice, stream, self._upload_link(self.alice, "voice-1723500000.m4a", "audio/mp4")
         )
-        now_a_card = self._post(self.alice, stream, "Join the call")
+        now_a_card = self._post(self.alice, stream, "Calling you")
         check_update_message(
-            self.alice, now_a_card, content='<!-- meeting:{"room":"r"} -->\nJoin at 9'
+            self.alice, now_a_card, content=_card("call_event", {"call_id": "c"}, "Missed call")
         )
 
         items = self._sweep([edited, voice, now_a_card])
@@ -413,3 +464,18 @@ class TestSweep(CandidatesTestCase):
         ).message_id
 
         self.assertEqual(list(self._sweep([kept, deleted, foreign, 10**9])), [kept])
+
+    def test_text_cap_truncates_and_says_so(self) -> None:
+        stream = self._stream([self.reader, self.alice])
+        posted = [self._post(self.alice, stream) for _ in range(3)]
+        one_text = len(Message.objects.get(id=posted[0]).content.encode())
+        body = {"workspace_id": str(self.workspace_id), "message_ids": posted}
+
+        with patch("nodl.api.views.derived_candidates.MAX_PAGE_TEXT_BYTES", one_text * 2):
+            capped = json.loads(self._call(body).content)
+        whole = json.loads(self._call(body).content)
+
+        self.assertEqual([item["message_id"] for item in capped["items"]], posted[:2])
+        self.assertIs(capped["truncated"], True)
+        self.assertEqual([item["message_id"] for item in whole["items"]], posted)
+        self.assertIs(whole["truncated"], False)

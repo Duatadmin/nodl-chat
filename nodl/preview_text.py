@@ -47,18 +47,17 @@ _MARKER_UNTERMINATED_RE = re.compile(rf"<!--\s*{_MARKER_PREFIXES}[\s\S]*$")
 # Real comment nodes: same grammar, applied to the node's inner text.
 _MARKER_COMMENT_BODY_RE = re.compile(rf"^\s*{_MARKER_PREFIXES}")
 
-# The opening of any marker, terminated or not.
-_MARKER_OPEN_RE = re.compile(rf"<!--\s*{_MARKER_PREFIXES}")
+# A card message: its content opens with the nodl-card marker (card_schemas
+# build_card_message_content), ahead of the markdown fallback.
+_CARD_MESSAGE_RE = re.compile(r"^\s*<!--\s*nodl-card:v1:")
 
 
-def contains_nodl_marker(content: str) -> bool:
-    """Whether raw message content carries a nodl machine marker.
+def is_card_message(content: str) -> bool:
+    """Whether raw message content is a nodl card (marker first).
 
-    Cards and meeting messages are data the clients word themselves; the
-    translation pipeline skips them (see nodl/derived_content.py). A plain
-    HTML comment a user typed is not a marker.
+    A card quoted inside another message doesn't make that message a card.
     """
-    return _MARKER_OPEN_RE.search(content) is not None
+    return _CARD_MESSAGE_RE.match(content) is not None
 
 
 def strip_marker_text(text: str) -> str:

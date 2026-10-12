@@ -12,10 +12,11 @@ A later real user edit re-renders from raw markdown and drops the appended
 block (same class as embed_links previews). check_update_message handles
 both kinds: a voice note's block is carried into the new render when the
 edit keeps the voice note, and an edited text message is re-queued to the
-backend tagged as an edit. A text attach may carry `source_hash`, the hash
-of the text it translated; when the message has been edited since, the
-attach is refused with 409 STALE_SOURCE rather than pinning a translation
-of the old text onto the new one.
+backend tagged as an edit — unless the edit left its translatable text as
+it was, which carries the block instead. A text attach may carry
+`source_hash`, the hash of the text it translated; when the message has
+been edited since, the attach is refused with 409 STALE_SOURCE rather than
+pinning a translation of the old text onto the new one.
 """
 
 import json
