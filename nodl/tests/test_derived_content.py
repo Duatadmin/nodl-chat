@@ -6,7 +6,10 @@ append/replace of the nodl-derived block in rendered_content. These run
 without the Django app registry (django.utils.html.escape needs no setup).
 """
 
+import base64
+import json
 import unittest
+from typing import Any
 
 from nodl.derived_content import (
     DERIVED_BLOCK_RE,
@@ -19,6 +22,14 @@ from nodl.derived_content import (
 )
 
 RENDERED = '<p><a href="/user_uploads/2/ab/xyz/voice-1723500000.m4a">voice-1723500000.m4a</a></p>'
+
+
+def build_card_message_content(card_type: str, payload: dict[str, Any], fallback: str) -> str:
+    """The AD-12 card content shape (nodl/api/views/card_schemas.py), built
+    here because importing nodl.api.views needs the Django app registry."""
+    raw = json.dumps({"card_type": card_type, "payload": payload}, ensure_ascii=False)
+    encoded = base64.urlsafe_b64encode(raw.encode("utf-8")).decode("ascii")
+    return f"<!-- nodl-card:v1:{encoded} -->\n\n{fallback}"
 
 
 class VoiceNotePathIdTest(unittest.TestCase):
@@ -62,6 +73,48 @@ class TranslationTextTest(unittest.TestCase):
         self.assertIsNone(
             translation_text("вот файл https://chat.example/user_uploads/2/ab/x/report.pdf")
         )
+
+
+class TranslationTextMarkerTest(unittest.TestCase):
+    """W0 P5a: nodl machine markers are data the clients word themselves —
+    their payload (base64 or JSON) must never reach the translator."""
+
+    def test_call_event_card_is_skipped(self) -> None:
+        # Sent with the human caller as sender, so the bot filter misses it.
+        content = build_card_message_content(
+            "call_event",
+            {"call_id": "c-1", "status": "missed", "caller_id": 7, "callee_id": 9},
+            "Missed call",
+        )
+        self.assertIsNone(translation_text(content))
+
+    def test_assistant_card_is_skipped(self) -> None:
+        content = build_card_message_content(
+            "ask_ai_answer",
+            {"task_id": "t-1", "mode": "qa", "question": "Когда бетон?", "answer": "Завтра."},
+            "**Ask AI**: Завтра.",
+        )
+        self.assertIsNone(translation_text(content))
+
+    def test_meeting_marker_is_skipped(self) -> None:
+        # Human-sent from the web composer; no /user_uploads reference.
+        content = (
+            '<!-- meeting:{"room":"site-standup","title":"Standup"} -->\nJoin the meeting at 9'
+        )
+        self.assertIsNone(translation_text(content))
+
+    def test_every_marker_prefix_is_skipped(self) -> None:
+        for prefix in ("nodl-card:v1:", "meeting:", "nodl-derived:v1:", "file:"):
+            with self.subTest(prefix=prefix):
+                self.assertIsNone(translation_text(f"<!--{prefix}eyJ4IjoxfQ== -->\nhi"))
+
+    def test_plain_text_still_translates(self) -> None:
+        self.assertEqual(translation_text("Pour tomorrow at 7"), "Pour tomorrow at 7")
+
+    def test_non_nodl_html_comment_still_translates(self) -> None:
+        # A comment a user typed is not nodl's grammar; it stays visible text.
+        content = "<!-- note to self --> Бетон привезли"
+        self.assertEqual(translation_text(content), content)
 
 
 class PayloadCodecTest(unittest.TestCase):

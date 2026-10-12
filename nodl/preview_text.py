@@ -47,6 +47,19 @@ _MARKER_UNTERMINATED_RE = re.compile(rf"<!--\s*{_MARKER_PREFIXES}[\s\S]*$")
 # Real comment nodes: same grammar, applied to the node's inner text.
 _MARKER_COMMENT_BODY_RE = re.compile(rf"^\s*{_MARKER_PREFIXES}")
 
+# The opening of any marker, terminated or not.
+_MARKER_OPEN_RE = re.compile(rf"<!--\s*{_MARKER_PREFIXES}")
+
+
+def contains_nodl_marker(content: str) -> bool:
+    """Whether raw message content carries a nodl machine marker.
+
+    Cards and meeting messages are data the clients word themselves; the
+    translation pipeline skips them (see nodl/derived_content.py). A plain
+    HTML comment a user typed is not a marker.
+    """
+    return _MARKER_OPEN_RE.search(content) is not None
+
 
 def strip_marker_text(text: str) -> str:
     """Remove nodl marker text (complete or truncated-tail) from plain text."""

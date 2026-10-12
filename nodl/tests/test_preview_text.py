@@ -13,6 +13,7 @@ run under the plain-pytest CI job. Fixtures mirror the REAL rendered shapes:
 import unittest
 
 from nodl.preview_text import (
+    contains_nodl_marker,
     defer_leading_mentions,
     split_inline_images,
     strip_marker_text,
@@ -156,6 +157,24 @@ class StripMarkerTextTest(unittest.TestCase):
     def test_non_marker_comment_text_survives(self) -> None:
         text = "before <!-- just a note --> after"
         self.assertEqual(strip_marker_text(text), text)
+
+
+class ContainsNodlMarkerTest(unittest.TestCase):
+    def test_every_marker_kind_is_detected(self) -> None:
+        for content in (
+            "<!-- nodl-card:v1:eyJ4IjoxfQ== -->\n\nMissed call",
+            '<!-- meeting:{"room":"r"} -->\nJoin',
+            "<!--nodl-derived:v1:eyJ4IjoxfQ== -->",
+            'see <!-- file:{"path_id":"x"} -->',
+            "<!-- nodl-card:v1:eyJjYXJkX3R5cGUiOiAiY2FsbF9ldmVu",  # unterminated
+        ):
+            with self.subTest(content=content):
+                self.assertTrue(contains_nodl_marker(content))
+
+    def test_plain_text_and_foreign_comments_are_not_markers(self) -> None:
+        for content in ("Pour at 7", "before <!-- just a note --> after", "meeting: 9am"):
+            with self.subTest(content=content):
+                self.assertFalse(contains_nodl_marker(content))
 
 
 if __name__ == "__main__":

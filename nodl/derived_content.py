@@ -27,6 +27,8 @@ from typing import Any
 
 from django.utils.html import escape
 
+from nodl.preview_text import contains_nodl_marker
+
 DERIVED_PAYLOAD_VERSION = 1
 
 # The voice-note discriminator: filenames minted by the mobile composer
@@ -58,10 +60,13 @@ def translation_text(content: str) -> str | None:
     V3 scope (founder 2026-08-13): only voice notes and PLAIN TEXT messages
     are translated. Any /user_uploads reference marks the message as an
     attachment message (image, document, pasted upload link) — those are
-    skipped entirely, captions included.
+    skipped entirely, captions included. So is any message carrying a nodl
+    machine marker (cards such as call_event, meeting messages): those are
+    data the clients word themselves, and their payload must never reach
+    the translator.
     """
     text = content.strip()
-    if not text or "/user_uploads/" in text:
+    if not text or "/user_uploads/" in text or contains_nodl_marker(text):
         return None
     return text
 
