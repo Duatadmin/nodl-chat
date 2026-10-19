@@ -33,6 +33,7 @@ from nodl.extensions.models import (
     NodlRealmExtension,
     NodlRealmUserExtension,
     NodlTaskStreamExtension,
+    NodlUserExtension,
 )
 from zerver.actions.create_user import do_create_user
 from zerver.actions.message_edit import do_update_message
@@ -66,6 +67,14 @@ class AssistantUpdateCardPayload(BaseModel):
     content: str
     card_type: str
     card_payload: dict[str, Any]
+
+
+class UserSendPayload(BaseModel):
+    workspace_id: str
+    task_id: str
+    topic: str = "task"
+    content: str
+    sender_supabase_user_id: str
 
 
 def _assistant_bot_email(realm: Realm) -> str:
@@ -341,6 +350,152 @@ def send_assistant_message(request: HttpRequest) -> HttpResponse:
         )
     except Exception as exc:
         logger.exception("assistant_send_failed")
+        return JsonResponse(
+            {"result": "error", "code": "SEND_FAILED", "msg": str(exc)},
+            status=500,
+        )
+
+
+def _resolve_sender(realm: Realm, supabase_user_id: str) -> UserProfile | None:
+    """Look up (never create) the Zulip profile for a nodl user in a realm.
+
+    Lookup-only on purpose: this backs send-as-user, and a message must
+    never be attributed to an account the platform had to invent on the
+    spot — if no mapping exists the caller reports SENDER_NOT_FOUND and
+    nodl-backend skips the send (the source record still holds the text).
+    """
+    try:
+        supabase_uuid = uuid.UUID(supabase_user_id)
+    except ValueError:
+        return None
+
+    mapping = (
+        NodlRealmUserExtension.objects.select_related("zulip_user")
+        .filter(zulip_realm=realm, supabase_user_id=supabase_uuid)
+        .first()
+    )
+    if mapping and mapping.zulip_user.realm_id == realm.id:
+        user = cast(UserProfile, mapping.zulip_user)
+        return user if user.is_active else None
+
+    global_mapping = (
+        NodlUserExtension.objects.select_related("zulip_user")
+        .filter(supabase_user_id=supabase_uuid, zulip_user__realm=realm)
+        .first()
+    )
+    if global_mapping and global_mapping.zulip_user:
+        user = cast(UserProfile, global_mapping.zulip_user)
+        return user if user.is_active else None
+    return None
+
+
+@csrf_exempt  # type: ignore[untyped-decorator]
+@require_service_auth  # type: ignore[untyped-decorator]
+def send_user_message(request: HttpRequest) -> HttpResponse:
+    """Post a message to a task stream as a specific human user.
+
+    POST /api/v1/internal/messages/send-as-user
+    Body: {workspace_id, task_id, topic?, content, sender_supabase_user_id}
+
+    Used for server-side writes that belong to a person, not the assistant —
+    e.g. echoing a check-in comment into the discussion under the responder's
+    name so it is part of the real conversation (summarizer, translation, and
+    Ask AI anchors all treat it as a human message). The sender must already
+    have a chat account in the workspace realm (lookup-only, see
+    _resolve_sender); it is a genuine message from their real account, no
+    forging involved.
+    """
+    if request.method != "POST":
+        return JsonResponse(
+            {"result": "error", "code": "METHOD_NOT_ALLOWED", "msg": "POST required"},
+            status=405,
+        )
+
+    try:
+        payload = UserSendPayload(**json.loads(request.body))
+    except json.JSONDecodeError:
+        return JsonResponse(
+            {"result": "error", "code": "INVALID_JSON", "msg": "Invalid JSON body"},
+            status=400,
+        )
+    except ValidationError as exc:
+        return JsonResponse(
+            {"result": "error", "code": "VALIDATION_ERROR", "msg": str(exc)},
+            status=400,
+        )
+
+    try:
+        task_uuid = uuid.UUID(payload.task_id)
+    except ValueError:
+        return JsonResponse(
+            {"result": "error", "code": "VALIDATION_ERROR", "msg": "Invalid task_id"},
+            status=400,
+        )
+
+    extension = _get_task_stream_extension(task_uuid, payload.workspace_id)
+    if extension is None:
+        return JsonResponse(
+            {"result": "error", "code": "TASK_STREAM_NOT_FOUND", "msg": "Task stream not found"},
+            status=404,
+        )
+
+    stream = extension.zulip_stream
+    if stream.deactivated:
+        return JsonResponse(
+            {"result": "error", "code": "STREAM_ARCHIVED", "msg": "Task stream is archived"},
+            status=409,
+        )
+
+    try:
+        realm = extension.zulip_realm
+        sender = _resolve_sender(realm, payload.sender_supabase_user_id)
+        if sender is None:
+            return JsonResponse(
+                {
+                    "result": "error",
+                    "code": "SENDER_NOT_FOUND",
+                    "msg": "No active chat account for this user in the workspace",
+                },
+                status=404,
+            )
+
+        # Participants are normally subscribed by task-stream sync; this is
+        # the same defensive re-subscribe the assistant-bot path uses (task
+        # streams are invite_only, so an unsubscribed sender cannot post).
+        if not Subscription.objects.filter(
+            user_profile=sender,
+            recipient=stream.recipient,
+            active=True,
+        ).exists():
+            bulk_add_subscriptions(
+                realm,
+                [stream],
+                [sender],
+                from_user_creation=True,
+                acting_user=None,
+            )
+
+        result = check_send_message(
+            sender=sender,
+            client=get_client("nodl-api"),
+            recipient_type_name="stream",
+            message_to=[stream.id],
+            topic_name=payload.topic,
+            message_content=payload.content,
+            realm=realm,
+            read_by_sender=True,
+        )
+        return JsonResponse(
+            {"result": "success", "message_id": result.message_id},
+            status=200,
+        )
+    except JsonableError as exc:
+        return JsonResponse(
+            {"result": "error", "code": "SEND_FAILED", "msg": str(exc)},
+            status=400,
+        )
+    except Exception as exc:
+        logger.exception("user_send_failed")
         return JsonResponse(
             {"result": "error", "code": "SEND_FAILED", "msg": str(exc)},
             status=500,

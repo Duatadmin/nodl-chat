@@ -6,6 +6,7 @@ from nodl.api.views import deactivate_realm, delete_user, sync_realm, sync_user
 from nodl.api.views.assistant import (
     get_task_stream_messages,
     send_assistant_message,
+    send_user_message,
     update_assistant_card,
 )
 from nodl.api.views.derived import attach_derived_content
@@ -89,6 +90,11 @@ urlpatterns = [
         "api/v1/internal/messages/send",
         send_assistant_message,
         name="nodl_assistant_send_message",
+    ),
+    path(
+        "api/v1/internal/messages/send-as-user",
+        send_user_message,
+        name="nodl_send_user_message",
     ),
     path(
         "api/v1/internal/messages/<int:message_id>/update-card",
