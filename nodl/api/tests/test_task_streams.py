@@ -12,6 +12,7 @@ from nodl.api.views.task_streams import (
     archive_task_stream,
     sync_task_stream,
     sync_task_stream_subscribers,
+    unarchive_task_stream,
 )
 
 
@@ -220,3 +221,81 @@ class TestTaskStreamSync(TestCase):
         mock_deactivate.assert_not_called()
         self.assertEqual(extension.task_title, "Install cabinets")
         extension.save.assert_called_once_with(update_fields=["task_title", "archived_at"])
+
+
+class TestTaskStreamUnarchive(TestCase):
+    """GB-74: a finished task's chat stays open; this reopens the chats that
+    were archived before."""
+
+    def setUp(self) -> None:
+        self.factory = RequestFactory()
+        self.payload = {
+            "workspace_id": str(uuid.uuid4()),
+            "task_id": str(uuid.uuid4()),
+            "zulip_stream_id": 42,
+            "task_title": "Install cabinets",
+        }
+
+    def _request(self, *, service: bool = True):
+        request = self.factory.post(
+            "/api/v1/internal/task-streams/unarchive",
+            data=json.dumps(self.payload),
+            content_type="application/json",
+        )
+        request.is_service_request = service
+        return request
+
+    def test_service_auth_required(self) -> None:
+        response = unarchive_task_stream(self._request(service=False))
+
+        self.assertEqual(response.status_code, 401)
+
+    @patch("nodl.api.views.task_streams._get_task_stream")
+    @patch("nodl.api.views.task_streams.do_unarchive_stream")
+    def test_unarchives_an_archived_stream_under_its_own_name(
+        self,
+        mock_unarchive: MagicMock,
+        mock_get_task_stream: MagicMock,
+    ) -> None:
+        extension = MagicMock()
+        extension.zulip_stream.deactivated = True
+        extension.zulip_stream.name = "task-abc"
+        extension.archived_at = "2026-10-23T00:33:57Z"
+        mock_get_task_stream.return_value = extension
+
+        response = unarchive_task_stream(self._request())
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(json.loads(response.content)["unarchived"])
+        mock_unarchive.assert_called_once_with(extension.zulip_stream, "task-abc", acting_user=None)
+        self.assertIsNone(extension.archived_at)
+        extension.save.assert_called_once_with(update_fields=["archived_at"])
+
+    @patch("nodl.api.views.task_streams._get_task_stream")
+    @patch("nodl.api.views.task_streams.do_unarchive_stream")
+    def test_unarchive_is_idempotent(
+        self,
+        mock_unarchive: MagicMock,
+        mock_get_task_stream: MagicMock,
+    ) -> None:
+        extension = MagicMock()
+        extension.zulip_stream.deactivated = False
+        extension.archived_at = None
+        mock_get_task_stream.return_value = extension
+
+        response = unarchive_task_stream(self._request())
+
+        self.assertEqual(response.status_code, 200)
+        mock_unarchive.assert_not_called()
+        extension.save.assert_not_called()
+
+    @patch("nodl.api.views.task_streams._get_task_stream")
+    def test_an_unknown_stream_is_not_found(self, mock_get_task_stream: MagicMock) -> None:
+        from nodl.extensions.models import NodlTaskStreamExtension
+
+        mock_get_task_stream.side_effect = NodlTaskStreamExtension.DoesNotExist
+
+        response = unarchive_task_stream(self._request())
+
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(json.loads(response.content)["code"], "STREAM_NOT_FOUND")

@@ -49,6 +49,7 @@ from nodl.api.views.task_streams import (
     archive_task_stream,
     sync_task_stream,
     sync_task_stream_subscribers,
+    unarchive_task_stream,
 )
 from nodl.api.views.uploads import upload_file
 from nodl.api.views.users import (
@@ -81,6 +82,11 @@ urlpatterns = [
         "api/v1/internal/task-streams/archive",
         archive_task_stream,
         name="nodl_archive_task_stream",
+    ),
+    path(
+        "api/v1/internal/task-streams/unarchive",
+        unarchive_task_stream,
+        name="nodl_unarchive_task_stream",
     ),
     path(
         "api/v1/internal/task-streams/<uuid:task_id>/messages",

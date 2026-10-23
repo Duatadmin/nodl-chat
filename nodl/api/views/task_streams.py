@@ -29,6 +29,7 @@ from zerver.actions.streams import (
     bulk_remove_subscriptions,
     do_change_stream_folder,
     do_deactivate_stream,
+    do_unarchive_stream,
 )
 from zerver.lib.streams import create_stream_if_needed
 from zerver.models import Realm, UserProfile
@@ -361,5 +362,44 @@ def archive_task_stream(request: HttpRequest) -> HttpResponse:
         logger.exception("task_stream_archive_failed")
         return JsonResponse(
             {"result": "error", "code": "ARCHIVE_FAILED", "msg": str(exc)},
+            status=500,
+        )
+
+
+@csrf_exempt  # type: ignore[untyped-decorator]
+@require_service_auth  # type: ignore[untyped-decorator]
+def unarchive_task_stream(request: HttpRequest) -> HttpResponse:
+    """Reopen an archived task-owned stream idempotently (GB-74: a finished
+    task's chat stays open for re-inspection; this reopens the chats archived
+    before that). The stream keeps its name, subscribers and history."""
+    if request.method != "POST":
+        return JsonResponse(
+            {"result": "error", "code": "METHOD_NOT_ALLOWED", "msg": "POST required"},
+            status=405,
+        )
+
+    payload = _parse_payload(request, TaskStreamArchivePayload)
+    if isinstance(payload, JsonResponse):
+        return payload
+
+    try:
+        extension = _get_task_stream(payload)
+        stream = extension.zulip_stream
+        if stream.deactivated:
+            do_unarchive_stream(stream, stream.name, acting_user=None)
+        if extension.archived_at is not None:
+            extension.archived_at = None
+            extension.save(update_fields=["archived_at"])
+        return JsonResponse({"result": "success", "unarchived": True}, status=200)
+    except NodlTaskStreamExtension.DoesNotExist:
+        # Nothing to reopen: the caller keeps its row archived.
+        return JsonResponse(
+            {"result": "error", "code": "STREAM_NOT_FOUND", "msg": "Task stream not found"},
+            status=404,
+        )
+    except Exception as exc:
+        logger.exception("task_stream_unarchive_failed")
+        return JsonResponse(
+            {"result": "error", "code": "UNARCHIVE_FAILED", "msg": str(exc)},
             status=500,
         )
